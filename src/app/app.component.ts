@@ -9,18 +9,17 @@ import { HttpClient } from '@angular/common/http';
 export class AppComponent implements OnInit {
   markdown: string = '';
 
-  constructor(private http: HttpClient) {} // Inject HttpClient here
+  constructor(private http: HttpClient) {}
 
   ngOnInit() {
-    console.log('ngOnInit');
-    this.readFile('assets/data.txt');
-  }
+    const repository = 'lhuangufl/ngx-markdown-playground';
+    const filePath = 'README.md';
+    const url = `https://api.github.com/repos/${repository}/contents/${filePath}`;
 
-  private readFile(filepath: string): void {
-    this.http.get(filepath, { responseType: 'text' }).subscribe(
-      (data) => {
-        console.log(data);
-        this.markdown = data;
+    this.http.get(url).subscribe(
+      (response: any) => {
+        const content = response.content;
+        this.markdown = atob(content); // Decode base64 content
       },
       (error: any) => {
         console.error('Error occurred while reading the file:', error);

@@ -2,6 +2,7 @@ import { NgModule } from '@angular/core';
 import { BrowserModule } from '@angular/platform-browser';
 import { FormsModule } from '@angular/forms';
 import { MarkdownModule } from 'ngx-markdown';
+import { HttpClientModule } from '@angular/common/http';
 
 import 'prismjs';
 import 'prismjs/components/prism-typescript.min.js';
@@ -11,12 +12,13 @@ import 'prismjs/plugins/line-highlight/prism-line-highlight.js';
 import { AppComponent } from './app.component';
 
 @NgModule({
-  imports:      [
+  imports: [
     BrowserModule,
     FormsModule,
+    HttpClientModule,
     MarkdownModule.forRoot(),
   ],
-  declarations: [ AppComponent ],
-  bootstrap:    [ AppComponent ]
+  declarations: [AppComponent],
+  bootstrap: [AppComponent],
 })
-export class AppModule { }
+export class AppModule {}
