@@ -1,4 +1,4 @@
-import { Component, VERSION } from '@angular/core';
+import { Component, OnInit } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
 
 @Component({
@@ -6,16 +6,25 @@ import { HttpClient } from '@angular/common/http';
   templateUrl: './app.component.html',
   styleUrls: ['./app.component.css'],
 })
-export class AppComponent {
-  angularVersion = VERSION.full;
-  ngxMarkdownVersion = '16.0.0';
-  constructor(private http: HttpClient) {}
+export class AppComponent implements OnInit {
+  markdown: string = '';
+
+  constructor(private http: HttpClient) {} // Inject HttpClient here
+
   ngOnInit() {
-    this.http
-      .get('../assets/data.md', { responseType: 'text' })
-      .subscribe((data) => {
-        this.markdown = data;
-      });
+    console.log('ngOnInit');
+    this.readFile('assets/data.txt');
   }
-  markdown: string;
+
+  private readFile(filepath: string): void {
+    this.http.get(filepath, { responseType: 'text' }).subscribe(
+      (data) => {
+        console.log(data);
+        this.markdown = data;
+      },
+      (error: any) => {
+        console.error('Error occurred while reading the file:', error);
+      }
+    );
+  }
 }
