@@ -1,6 +1,17 @@
 <h6>angular@{{ angularVersion }} | ngx-markdown@{{ ngxMarkdownVersion }}</h6>
-<br />
+
+<button (click)="toggleSwitch()">Toggle Switch</button>
+
+<div *ngIf="showTextarea">
+  <textarea [(ngModel)]="text"></textarea>
+  <button (click)="save()">Save</button>
+</div>
+
+<div *ngIf="!showTextarea">{{ text }}</div>
+
 <textarea class="variable-textarea" [(ngModel)]="markdown"></textarea>
 
 <br />
 <markdown class="variable-binding" [data]="markdown"></markdown>
+
+<br />
