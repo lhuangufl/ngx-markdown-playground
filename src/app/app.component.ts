@@ -19,6 +19,7 @@ export class AppComponent implements OnInit {
     this.http.get(url).subscribe(
       (response: any) => {
         const content = response.content;
+        
         this.markdown = atob(content); // Decode base64 content
       },
       (error: any) => {
