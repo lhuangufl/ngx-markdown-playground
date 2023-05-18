@@ -1,0 +1,2 @@
+The Hypothetical Portfolio Exercise (HPE) is a component of the Fundamental Review of the Trading Book (FRTB). 
+It involves the hypothetical revaluation of a bank's trading book to assess the impact of market risk factors on the value of the portfolio. The results of the HPE are used to determine the market risk capital charge (MRCC) that the bank must hold to cover potential losses in the trading book.
