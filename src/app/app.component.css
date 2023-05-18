@@ -16,91 +16,17 @@
     0 2px 3px 1px rgba(0, 0, 0, 0.06);
 }
 
-.variable-binding {
-  display: block;
-  float: right;
-}
-
-.variable-binding {
-  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-  font-size: 14px;
-  line-height: 1.6;
-  color: #333;
-}
-
-.variable-binding h1 {
-  font-size: 28px;
-  font-weight: bold;
-  margin: 20px 0;
-}
-
-.variable-binding h2 {
-  font-size: 24px;
-  font-weight: bold;
-  margin: 20px 0;
-}
-
-.variable-binding h3 {
-  font-size: 20px;
-  font-weight: bold;
-  margin: 20px 0;
-}
-
-.variable-binding p {
-  margin: 10px 0;
-}
-
-.variable-binding ul,
-.variable-binding ol {
-  margin: 10px 0;
-  padding-left: 20px;
-}
-
-.variable-binding li {
-  margin: 5px 0;
-}
-
-.variable-binding a {
-  color: #007bff;
-  text-decoration: none;
-}
-
-.variable-binding a:hover {
-  text-decoration: underline;
-}
-
-.variable-binding code {
-  font-family: Consolas, Monaco, 'Courier New', Courier, monospace;
-  background-color: #f8f8f8;
-  padding: 2px 4px;
-  border-radius: 4px;
-}
-
-.variable-binding pre {
-  background-color: #f8f8f8;
-  padding: 10px;
-  border-radius: 4px;
-  overflow-x: auto;
-}
-
-.variable-binding pre {
-  background-color: #f8f8f8;
-  padding: 10px;
-  border-radius: 4px;
-  overflow-x: auto;
-}
-
-.variable-binding table {
+::ng-deep .variable-binding table {
   border-collapse: collapse;
   width: 100%;
 }
 
-.variable-binding table th,
-.variable-binding table td {
-  border: 1px solid #ddd; /* Add border to table cells */
-  padding: 8px; /* Add padding for spacing inside cells */
+::ng-deep .variable-binding table th,
+::ng-deep .variable-binding table td {
+  border: 1px solid #ddd;
+  padding: 8px;
 }
 
-.variable-binding table th {
-  background-color: #f2f2f2; /* Add background color to table header cells */
+::ng-deep .variable-binding table th {
+  background-color: #f2f2f2;
 }
