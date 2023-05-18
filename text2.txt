@@ -1,0 +1,2 @@
+FX risk refers to the risk associated with fluctuations in foreign exchange rates. 
+In the context of SA-CVA, FX risk factors are used to determine the potential credit exposure of a derivative transaction due to changes in exchange rates.
