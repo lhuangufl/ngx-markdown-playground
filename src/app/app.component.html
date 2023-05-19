@@ -1,25 +1,25 @@
-<h6>angular@{{ angularVersion }} | ngx-markdown@{{ ngxMarkdownVersion }}</h6>
+<div class="container">
+  <h6>angular@{{ angularVersion }} | ngx-markdown@{{ ngxMarkdownVersion }}</h6>
 
-<button (click)="toggleSwitch()">Toggle Switch</button>
+  <button (click)="toggleSwitch()">Toggle Switch</button>
 
-<div *ngIf="showTextarea">
-  <textarea [(ngModel)]="text"></textarea>
-  <button (click)="save()">Save</button>
+  <div *ngIf="showTextarea">
+    <textarea [(ngModel)]="text"></textarea>
+    <button (click)="save()">Save</button>
+  </div>
+
+  <div *ngIf="!showTextarea">{{ text }}</div>
+
+  <textarea class="variable-textarea" [(ngModel)]="markdown_origin"></textarea>
+
+  <br />
+  <markdown class="variable-binding" [data]="markdown"></markdown>
+
+  <br />
 </div>
 
-<div *ngIf="!showTextarea">{{ text }}</div>
-
-<textarea class="variable-textarea" [(ngModel)]="markdown"></textarea>
-
-<br />
-<markdown class="variable-binding" [data]="markdown"></markdown>
-
-<br />
-
-<script src="https://unpkg.com/@observablehq/stdlib@3"></script>
-<script>
-
-  const {DOM} = new observablehq.Library;
-
-  console.log(DOM.uid);
-</script>
+<div class="full flex">
+  <!-- <div> {{ count }} </div> -->
+  <!-- <div>{{data | json}}</div> -->
+  <div class="chart" [innerHTML]="svg">{{ svg }}</div>
+</div>
