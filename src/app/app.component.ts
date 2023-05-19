@@ -4,6 +4,7 @@ import { FileAttachment } from '@observablehq/stdlib';
 import * as Plot from '@observablehq/plot';
 import $ from 'jquery';
 import { map } from 'rxjs/operators';
+import mermaid from 'mermaid';
 
 @Component({
   selector: 'my-app',
@@ -113,4 +114,3 @@ export class AppComponent implements OnInit {
     this.chartRef.html(svg);
   }
 }
-
