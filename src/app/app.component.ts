@@ -2,9 +2,7 @@ import { Component, OnInit } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
 import { FileAttachment } from '@observablehq/stdlib';
 import * as Plot from '@observablehq/plot';
-import * as _ from 'lodash';
 import $ from 'jquery';
-import * as d3 from 'd3';
 import { map } from 'rxjs/operators';
 
 @Component({
@@ -115,3 +113,4 @@ export class AppComponent implements OnInit {
     this.chartRef.html(svg);
   }
 }
+
