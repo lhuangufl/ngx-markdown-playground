@@ -26,6 +26,29 @@ export class AppComponent implements OnInit {
 
   ngAfterViewInit() {
     this.chartRef = $('.chart');
+
+    //
+    // mermaid.initialize({
+    //   startOnLoad: true,
+    //   flowchart: {
+    //     useMaxWidth: true,
+    //     htmlLabels: true,
+    //     curve: 'cardinal',
+    //   },
+    //   securityLevel: 'loose',
+    // });
+
+    // const element: any = this.mermaidDiv.nativeElement;
+    // const graphDefinition = `graph TD
+    //   A[Christmas] -->|Get money| B(Go shopping)
+    //   B --> C(Let me think)
+    //   C -->|One| D[Laptop]
+    //   C -->|Two| E[iPhone]
+    //   C -->|Three| F[fa:fa-car Car]
+    //   A[Christmas] -->|Get money| D[Laptop]
+    //   B --> E`;
+
+    // mermaid.render('mermaidDiv', graphDefinition);
   }
 
   async ngOnInit() {
