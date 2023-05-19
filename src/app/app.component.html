@@ -15,3 +15,11 @@
 <markdown class="variable-binding" [data]="markdown"></markdown>
 
 <br />
+
+<script src="https://unpkg.com/@observablehq/stdlib@3"></script>
+<script>
+
+  const {DOM} = new observablehq.Library;
+
+  console.log(DOM.uid);
+</script>
