@@ -26,7 +26,10 @@ export class AppComponent implements OnInit {
 
   ngAfterViewInit() {
     this.chartRef = $('.chart');
-
+    mermaid.initialize({
+      securityLevel: 'loose',
+    });
+    mermaid.init();
     //
     // mermaid.initialize({
     //   startOnLoad: true,
