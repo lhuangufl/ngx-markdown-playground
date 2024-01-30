@@ -38,3 +38,60 @@ public class SparkDataProcessor {
         }
     }
 }
+
+
+import org.apache.commons.math3.optim.linear.LinearObjectiveFunction;
+import org.apache.commons.math3.optim.linear.LinearConstraint;
+import org.apache.commons.math3.optim.linear.Relationship;
+import org.apache.commons.math3.optim.linear.SimplexSolver;
+import org.apache.commons.math3.optim.linear.PointValuePair;
+import org.apache.commons.math3.optim.nonlinear.scalar.GoalType;
+import org.apache.commons.math3.optim.linear.NonNegativeConstraint;
+
+public class HedgeAllocationSolver {
+
+    public static void main(String[] args) {
+        // Define the hedge sensitivity array and ideal allocation ratio
+        double[] hedgeSensitivityArray = {10, 20};
+
+        // Calculate the total aggregate hedge sensitivity by summing the elements of the array
+        double totalAggregateHedgesSensitivity = 0;
+        for (double sensitivity : hedgeSensitivityArray) {
+            totalAggregateHedgesSensitivity += sensitivity;
+        }
+        double idealHedgeAllocationRatioForSA = 0.75; // This would be ratioConstant
+
+        // The objective function coefficients (in the Python code, this is hedgeSensitivityArray - idealHedgeAllocationRatioForSA * totalAggregateHedgesSensitivity)
+        double[] objectiveCoefficients = new double[hedgeSensitivityArray.length];
+        for (int i = 0; i < hedgeSensitivityArray.length; i++) {
+            objectiveCoefficients[i] = hedgeSensitivityArray[i] - idealHedgeAllocationRatioForSA * totalAggregateHedgesSensitivity;
+        }
+
+        // Create the linear objective function to minimize
+        LinearObjectiveFunction objectiveFunction = new LinearObjectiveFunction(objectiveCoefficients, 0);
+
+        // Define the constraints (in this case, we are not enforcing boolean constraints)
+        Collection<LinearConstraint> constraints = new ArrayList<LinearConstraint>();
+        for (int i = 0; i < hedgeSensitivityArray.length; i++) {
+            // Each hedge sensitivity must be non-negative
+            constraints.add(new LinearConstraint(new double[hedgeSensitivityArray.length], Relationship.GEQ, 0));
+        }
+
+        // Create and run the solver
+        SimplexSolver solver = new SimplexSolver();
+        PointValuePair solution = solver.optimize(
+                new MaxIter(100), // Maximum number of iterations
+                objectiveFunction, // Objective function to minimize
+                new LinearConstraintSet(constraints), // The constraints
+                GoalType.MINIMIZE, // Type of optimization goal: minimize
+                new NonNegativeConstraint(true) // The decision variables must be non-negative
+        );
+
+        // Output the solution
+        double[] solutionPoint = solution.getPoint();
+        System.out.println("Solution: ");
+        for (double v : solutionPoint) {
+            System.out.println(v);
+        }
+    }
+}
