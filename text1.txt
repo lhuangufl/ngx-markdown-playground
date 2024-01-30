@@ -95,3 +95,20 @@ public class HedgeAllocationSolver {
         }
     }
 }
+
+The objective function for the optimization problem is defined as the minimization of the \( L_1 \) norm of the difference between the actual allocation of hedge sensitivities and the product of the ideal hedge allocation ratio for SA with the total aggregate hedge sensitivities. Mathematically, this can be expressed as:
+
+$$
+\text{minimize} \quad \left\| \mathbf{H}^T \mathbf{x} - r \cdot S \right\|_1
+$$
+
+where:
+
+- $\mathbf{H}$ is the hedgeSensitivityArray, a column vector of hedge sensitivities.
+- $\mathbf{H}^T$ is the transpose of \( \mathbf{H} \), turning it into a row vector.
+- $\mathbf{H}\mathbf{x}$ is the vector of decision variables where each element is binary (either 0 or 1), indicating the allocation of a hedge to SA.
+- $\mathbf{r}$ represents the idealHedgeAllocationRatioForSA, which is a scalar constant.
+- $\mathbf{s}$ is the totalAggregateHedgesSensitivity, the sum of all elements in \( \mathbf{H} \).
+- $\left\| \right\|$ denotes the $L_1$ norm, summing the absolute values of the elements in the vector.
+
+The goal of the optimization is to find a vector $\mathbf{x}$ that minimizes this objective function subject to the given constraints.
