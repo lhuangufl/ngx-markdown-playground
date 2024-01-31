@@ -112,3 +112,83 @@ where:
 - $\left\| \right\|$ denotes the $L_1$ norm, summing the absolute values of the elements in the vector.
 
 The goal of the optimization is to find a vector $\mathbf{x}$ that minimizes this objective function subject to the given constraints.
+
+
+
+import com.google.ortools.Loader;
+import com.google.ortools.linearsolver.MPConstraint;
+import com.google.ortools.linearsolver.MPObjective;
+import com.google.ortools.linearsolver.MPSolver;
+import com.google.ortools.linearsolver.MPVariable;
+
+import java.util.Arrays;
+import java.util.Random;
+import java.util.stream.DoubleStream;
+
+public class Main {
+
+    public static void main(String[] args) {
+        long startTime = System.currentTimeMillis();
+        Loader.loadNativeLibraries();
+        // Create the solver
+        MPSolver solver = new MPSolver(
+
+                "HedgeAllocationOptimization",
+                MPSolver.OptimizationProblemType.CBC_MIXED_INTEGER_PROGRAMMING);
+        double[] hedgeSensitivityArray = DoubleStream.generate(() -> new Random().nextDouble() * 1000000).limit(1000).toArray();
+        // Example hedge sensitivity array H
+        System.out.println(Arrays.toString(hedgeSensitivityArray));
+        double hedgeSensitivityTotal = 0;
+        for (int i = 0; i < hedgeSensitivityArray.length; i++) {
+            hedgeSensitivityTotal += hedgeSensitivityArray[i];
+        }
+        double idealRatio = 0.75;
+
+        // Create binary decision variables x
+        MPVariable[] x = new MPVariable[hedgeSensitivityArray.length];
+        for (int i = 0; i < hedgeSensitivityArray.length; i++) {
+            x[i] = solver.makeIntVar(0, 1, "x" + i);
+        }
+//        MPVariable[] absDiff = new MPVariable[hedgeSensitivityArray.length];
+        // Create auxiliary variables to represent the absolute value of the total difference
+
+        MPVariable absDiff = solver.makeNumVar(0, Double.POSITIVE_INFINITY, "AbsDiff");
+
+        // Define the objective function to minimize the total absolute difference
+        MPObjective objective = solver.objective();
+        objective.setCoefficient(absDiff, 1);
+        objective.setMinimization();
+
+        // Sum the differences
+        double idealTotal = idealRatio*hedgeSensitivityTotal;
+        MPConstraint positiveConstraint = solver.makeConstraint(Double.NEGATIVE_INFINITY, idealTotal);
+        MPConstraint negativeConstraint = solver.makeConstraint(idealTotal, Double.POSITIVE_INFINITY);
+
+        for (int i = 0; i < hedgeSensitivityArray.length; i++) {
+            positiveConstraint.setCoefficient(x[i], hedgeSensitivityArray[i]);
+            negativeConstraint.setCoefficient(x[i], hedgeSensitivityArray[i]);
+        }
+        positiveConstraint.setCoefficient(absDiff, -1);
+        negativeConstraint.setCoefficient(absDiff,1);
+
+
+        // Solve the problem
+        final MPSolver.ResultStatus resultStatus = solver.solve();
+        long endTime = System.currentTimeMillis();
+        long timeTaken = endTime - startTime;
+        System.out.println("Time taken: " + timeTaken + " milliseconds.");
+        // Check if an optimal solution has been found
+        if (resultStatus == MPSolver.ResultStatus.OPTIMAL) {
+            System.out.println("Optimal solution found!");
+            System.out.println("IdealTotalRatio = " + 0.75);
+            // Output the solution
+            double actualTotal = 0;
+            for (int i=0; i<x.length; ++i) {
+                actualTotal += x[i].solutionValue() * hedgeSensitivityArray[i];
+            }
+            System.out.println("ActualTotalRatio = " + actualTotal/idealTotal);
+        } else {
+            System.out.println("The problem does not have an optimal solution.");
+        }
+    }
+}
