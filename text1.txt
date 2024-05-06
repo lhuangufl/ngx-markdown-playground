@@ -59,6 +59,22 @@ public class HedgeAllocationSolver {
         for (double sensitivity : hedgeSensitivityArray) {
             totalAggregateHedgesSensitivity += sensitivity;
         }
+
+
+During our recent evaluations, an important issue surfaced regarding the attribute mapping in our Data Dictionary. It appears that our system maps attributes based on their order rather than their names. This was initially thought to be a minor quirk; however, it has potential to introduce subtle and hard-to-detect errors in our data handling processes.
+
+Issue Description:
+When extracting data sets from our primary source, Zinc, we expect each attribute to correspond precisely with our internal data dictionary. However, due to the attribute mapping being order-dependent rather than name-dependent, discrepancies can occur if the order in Zinc changes or if attributes are interpreted differently due to their sequence.
+
+This issue was highlighted during the tests involving our new Data Quality Control module, which could amplify the risk of data mismatches and inconsistencies.
+
+Proposed Next Steps:
+
+Immediate Review: I recommend that we conduct an immediate review of how attributes are mapped in our system, particularly focusing on modules interfacing with external data sources like Zinc.
+Risk Assessment: We need to evaluate the potential impacts this could have on our data integrity, especially in critical data flows.
+Update Implementation: Depending on our findings, it may be necessary to update our system to map attributes based on names instead of order to prevent any future issues.
+Testing and Validation: After implementing changes, a thorough testing phase should follow to ensure that the data is accurately mapped and consistent with our data dictionary standards.
+Please let me know your thoughts on this and how soon we can assemble the team to discuss this in further detail. Your immediate attention to this matter would be greatly appreciated as we strive to maintain the highest standards of data quality and integrity.
         double idealHedgeAllocationRatioForSA = 0.75; // This would be ratioConstant
 
         // The objective function coefficients (in the Python code, this is hedgeSensitivityArray - idealHedgeAllocationRatioForSA * totalAggregateHedgesSensitivity)
