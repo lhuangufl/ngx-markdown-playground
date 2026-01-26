@@ -12,16 +12,32 @@ import java.util.stream.IntStream;
 
 public class DirectSparkRiskEngine {
 
-    // Definition of Deal: Renamed from DealRecord to Deal
-    // Defined as a static record to be safely included within the same file.
-    public record Deal(
-        String RiskWeightDerivingCoperID, 
-        String UltimateParentIdentifier,  
-        String RFTenor,                   
-        String CreditQuality,             
-        boolean IsQualifiedIndex,         
-        double RiskWeightedNetSensitivity 
-    ) {}
+    // REPLACEMENT: Use a static class instead of 'record' for Java 8/11 compatibility.
+    // We use 'public final' fields to allow direct access (e.g., deal.RFTenor) similar to struct.
+    public static class Deal {
+        public final String RiskWeightDerivingCoperID;
+        public final String UltimateParentIdentifier;
+        public final String RFTenor;
+        public final String CreditQuality;
+        public final boolean IsQualifiedIndex;
+        public final double RiskWeightedNetSensitivity;
+
+        public Deal(
+            String RiskWeightDerivingCoperID,
+            String UltimateParentIdentifier,
+            String RFTenor,
+            String CreditQuality,
+            boolean IsQualifiedIndex,
+            double RiskWeightedNetSensitivity
+        ) {
+            this.RiskWeightDerivingCoperID = RiskWeightDerivingCoperID;
+            this.UltimateParentIdentifier = UltimateParentIdentifier;
+            this.RFTenor = RFTenor;
+            this.CreditQuality = CreditQuality;
+            this.IsQualifiedIndex = IsQualifiedIndex;
+            this.RiskWeightedNetSensitivity = RiskWeightedNetSensitivity;
+        }
+    }
 
     /**
      * Public Interface
@@ -30,7 +46,7 @@ public class DirectSparkRiskEngine {
         // Step 1: Collect data
         List<Row> rows = inputDataset.collectAsList();
         
-        // Step 2: Convert to Java Objects (Deal)
+        // Step 2: Convert to Java Objects (Deal Class)
         List<Deal> records = new ArrayList<>(rows.size());
         for (Row r : rows) {
             records.add(new Deal(
