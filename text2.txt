@@ -141,3 +141,227 @@ public class DirectSparkRiskEngine {
         return rho;
     }
 }
+
+
+
+
+-----------------------
+
+import org.apache.spark.sql.Dataset;
+import org.apache.spark.sql.Row;
+import java.util.List;
+import java.util.ArrayList;
+import java.util.Objects;
+import java.util.concurrent.atomic.DoubleAdder;
+import java.util.stream.IntStream;
+
+public class DirectSparkRiskEngine {
+
+    // Constant R for the Hedge Disallowance Term (Standard Basel III value is 0.01)
+    private static final double R_FACTOR = 0.01;
+
+    // Static class acting as a data carrier
+    // Updated to include ALL attributes from the schema image
+    public static class Deal {
+        // String Fields
+        public final String AggLevel;
+        public final String AggLevelValue;
+        public final String CreditQuality;
+        public final String Regime;
+        public final String RFBucket;
+        public final String RFTenor;
+        public final String RiskClass;
+        public final String RiskWeightDerivingCoperID;
+        public final String ScenarioType;
+        public final String UltimateParentIdentifier;
+        
+        // Boolean Field
+        public final boolean IsQualifiedIndex;
+        
+        // Numeric Fields (Sensitivities)
+        public final double RiskWeightedCvaSensitivity;
+        public final double RiskWeightedHedgeSensitivity;
+        public final double RiskWeightedNetSensitivity;
+
+        public Deal(
+            String AggLevel,
+            String AggLevelValue,
+            String CreditQuality,
+            String Regime,
+            String RFBucket,
+            String RFTenor,
+            String RiskClass,
+            String RiskWeightDerivingCoperID,
+            String ScenarioType,
+            String UltimateParentIdentifier,
+            boolean IsQualifiedIndex,
+            double RiskWeightedCvaSensitivity,
+            double RiskWeightedHedgeSensitivity,
+            double RiskWeightedNetSensitivity
+        ) {
+            this.AggLevel = AggLevel;
+            this.AggLevelValue = AggLevelValue;
+            this.CreditQuality = CreditQuality;
+            this.Regime = Regime;
+            this.RFBucket = RFBucket;
+            this.RFTenor = RFTenor;
+            this.RiskClass = RiskClass;
+            this.RiskWeightDerivingCoperID = RiskWeightDerivingCoperID;
+            this.ScenarioType = ScenarioType;
+            this.UltimateParentIdentifier = UltimateParentIdentifier;
+            this.IsQualifiedIndex = IsQualifiedIndex;
+            this.RiskWeightedCvaSensitivity = RiskWeightedCvaSensitivity;
+            this.RiskWeightedHedgeSensitivity = RiskWeightedHedgeSensitivity;
+            this.RiskWeightedNetSensitivity = RiskWeightedNetSensitivity;
+        }
+    }
+
+    /**
+     * Public Interface: Accepts Spark Dataset
+     */
+    public double run(Dataset<Row> inputDataset) {
+        // Step 1: Collect data from Spark to Driver memory
+        List<Row> rows = inputDataset.collectAsList();
+        
+        // Step 2: Convert to Java Objects (Deal Class) with FULL attributes
+        List<Deal> records = new ArrayList<>(rows.size());
+        for (Row r : rows) {
+            records.add(new Deal(
+                r.getAs("AggLevel"),
+                r.getAs("AggLevelValue"),
+                r.getAs("CreditQuality"),
+                r.getAs("Regime"),
+                r.getAs("RFBucket"),
+                r.getAs("RFTenor"),
+                r.getAs("RiskClass"),
+                r.getAs("RiskWeightDerivingCoperID"),
+                r.getAs("ScenarioType"),
+                r.getAs("UltimateParentIdentifier"),
+                
+                // Handle Boolean parsing safety
+                r.get(r.fieldIndex("IsQualifiedIndex")) instanceof Boolean ? 
+                    r.getAs("IsQualifiedIndex") : Boolean.parseBoolean(r.getAs("IsQualifiedIndex").toString()),
+                
+                // Handle Numeric parsing safety for all sensitivity columns
+                getDouble(r, "RiskWeightedCvaSensitivity"),
+                getDouble(r, "RiskWeightedHedgeSensitivity"),
+                getDouble(r, "RiskWeightedNetSensitivity")
+            ));
+        }
+
+        // Step 3: Calculate Kb
+        return calculateKb(records);
+    }
+
+    /**
+     * Helper to safely extract double from Spark Row regardless of underlying type (BigDecimal, Double, String)
+     */
+    private double getDouble(Row r, String colName) {
+        Object val = r.getAs(colName);
+        if (val == null) return 0.0;
+        if (val instanceof Number) {
+            return ((Number) val).doubleValue();
+        }
+        try {
+            return Double.parseDouble(val.toString());
+        } catch (NumberFormatException e) {
+            return 0.0;
+        }
+    }
+
+    /**
+     * Core Calculation Logic for Kb
+     * Formula: Sqrt( (Sum(WS^2) + Sum(Sum(Rho * WS * WS))) + R * Sum((WS_Hdg)^2) )
+     */
+    private double calculateKb(List<Deal> recordList) {
+        Deal[] nodes = recordList.toArray(new Deal[0]);
+        int N = nodes.length;
+
+        // Term 1: Sum of Squared Net Sensitivities (Diagonal)
+        DoubleAdder term1_DiagonalSum = new DoubleAdder();
+        
+        // Term 2: Correlated Sensitivities (Cross Terms)
+        DoubleAdder term2_CrossSum = new DoubleAdder();
+
+        // Term 3: Sum of Squared Hedge Sensitivities
+        DoubleAdder term3_HedgeSum = new DoubleAdder();
+
+        // Parallel Calculation
+        IntStream.range(0, N).parallel().forEach(i -> {
+            Deal r1 = nodes[i];
+
+            // --- Term 1: Sum(WS_k^2) ---
+            double netSensSq = r1.RiskWeightedNetSensitivity * r1.RiskWeightedNetSensitivity;
+            term1_DiagonalSum.add(netSensSq);
+
+            // --- Term 3: Sum((WS_k_Hdg)^2) ---
+            double hedgeSensSq = r1.RiskWeightedHedgeSensitivity * r1.RiskWeightedHedgeSensitivity;
+            term3_HedgeSum.add(hedgeSensSq);
+
+            // --- Term 2: Sum(Sum(Rho * WS_k * WS_l)) ---
+            // Calculate Upper Triangle (j > i) and multiply by 2
+            double localCrossSum = 0.0;
+            for (int j = i + 1; j < N; j++) {
+                Deal r2 = nodes[j];
+
+                double rho = getCorrelation(r1, r2);
+
+                // Cross terms use Net Sensitivities
+                localCrossSum += (r1.RiskWeightedNetSensitivity * r2.RiskWeightedNetSensitivity * rho) * 2.0;
+            }
+
+            if (localCrossSum != 0.0) {
+                term2_CrossSum.add(localCrossSum);
+            }
+        });
+
+        // Assemble the final formula components
+        double componentA = term1_DiagonalSum.sum() + term2_CrossSum.sum(); // (Diagonal + Cross)
+        double componentB = R_FACTOR * term3_HedgeSum.sum();                // R * Sum(Hedge^2)
+
+        // Final Result: Sqrt( A + B )
+        return Math.sqrt(Math.max(0.0, componentA + componentB));
+    }
+
+    /**
+     * Business Rules (Correlation Logic)
+     */
+    private double getCorrelation(Deal t1, Deal t2) {
+        
+        // Rule 1: Identical Check
+        if (Objects.equals(t1.RiskWeightDerivingCoperID, t2.RiskWeightDerivingCoperID) &&
+            Objects.equals(t1.RFTenor, t2.RFTenor) &&
+            Objects.equals(t1.CreditQuality, t2.CreditQuality) &&
+            Objects.equals(t1.UltimateParentIdentifier, t2.UltimateParentIdentifier)) {
+            return 0.0;
+        }
+
+        double rho = 1.0;
+
+        // Rule 2: Tenor Correlation
+        if (!Objects.equals(t1.RFTenor, t2.RFTenor)) {
+            rho *= 0.9;
+        }
+
+        // Rule 3: Credit Quality Correlation
+        if (!Objects.equals(t1.CreditQuality, t2.CreditQuality)) {
+            rho *= 0.8;
+        }
+
+        // Rule 4: Issuer / Parent Correlation
+        if (Objects.equals(t1.RiskWeightDerivingCoperID, t2.RiskWeightDerivingCoperID)) {
+            // Same Issuer -> 1.0
+        } 
+        else if (Objects.equals(t1.UltimateParentIdentifier, t2.UltimateParentIdentifier) 
+                 && t1.UltimateParentIdentifier != null) {
+            // Same Parent -> 0.9
+            rho *= 0.9;
+        } 
+        else {
+            // Different -> 0.5
+            rho *= 0.5;
+        }
+
+        return rho;
+    }
+}
