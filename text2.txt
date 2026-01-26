@@ -12,68 +12,66 @@ import java.util.stream.IntStream;
 
 public class DirectSparkRiskEngine {
 
-    // 1. 定义数据结构：字段名与你的 Spark DataFrame 列名保持完全一致
-    // 这样你就不用去改 mapping 逻辑了
-    public record DealRecord(
-        String RiskWeightDerivingCoperID, // 对应 Issuer
-        String UltimateParentIdentifier,  // 对应 Parent
-        String RFTenor,                   // 对应 Tenor
-        String CreditQuality,             // 对应 Quality
-        boolean IsQualifiedIndex,         // 对应 Index
-        double RiskWeightedNetSensitivity // 对应金额 (如果是聚合后的，可能是 NetSensitivity，请根据实际情况调整)
+    // Definition of Deal: Renamed from DealRecord to Deal
+    // Defined as a static record to be safely included within the same file.
+    public record Deal(
+        String RiskWeightDerivingCoperID, 
+        String UltimateParentIdentifier,  
+        String RFTenor,                   
+        String CreditQuality,             
+        boolean IsQualifiedIndex,         
+        double RiskWeightedNetSensitivity 
     ) {}
 
     /**
-     * 对外接口：直接接收你的 Spark Dataset
+     * Public Interface
      */
     public double run(Dataset<Row> inputDataset) {
-        // Step 1: 从 Spark 拉取数据到 Driver 内存 (假设数据量已聚合到万级，很安全)
+        // Step 1: Collect data
         List<Row> rows = inputDataset.collectAsList();
         
-        // Step 2: 转换为 Java 对象 (Mapping)
-        // 这里直接使用 row.getAs("原始列名")，无需改动
-        List<DealRecord> records = new ArrayList<>(rows.size());
+        // Step 2: Convert to Java Objects (Deal)
+        List<Deal> records = new ArrayList<>(rows.size());
         for (Row r : rows) {
-            records.add(new DealRecord(
+            records.add(new Deal(
                 r.getAs("RiskWeightDerivingCoperID"),
                 r.getAs("UltimateParentIdentifier"),
                 r.getAs("RFTenor"),
                 r.getAs("CreditQuality"),
-                // 处理 Boolean 可能的类型差异 (String vs Boolean)
+                // Handle Boolean parsing safety
                 r.get(r.fieldIndex("IsQualifiedIndex")) instanceof Boolean ? 
                     r.getAs("IsQualifiedIndex") : Boolean.parseBoolean(r.getAs("IsQualifiedIndex").toString()),
-                // 处理数值类型 (Double vs Decimal)
+                // Handle Number parsing safety (Double/BigDecimal)
                 ((Number) r.getAs("RiskWeightedNetSensitivity")).doubleValue() 
             ));
         }
 
-        // Step 3: 开始计算
+        // Step 3: Calculate
         return calculateCore(records);
     }
 
     /**
-     * 核心计算逻辑：多线程 + 对称矩阵优化 + 原始 String 比较
+     * Core Calculation Logic
      */
-    private double calculateCore(List<DealRecord> recordList) {
-        // 转为数组以获得最佳 CPU 缓存性能
-        DealRecord[] nodes = recordList.toArray(new DealRecord[0]);
+    private double calculateCore(List<Deal> recordList) {
+        // Convert List to Array for performance
+        Deal[] nodes = recordList.toArray(new Deal[0]);
         int N = nodes.length;
 
         DoubleAdder totalVariance = new DoubleAdder();
 
-        // 并行流：利用多核 CPU
+        // Parallel Calculation
         IntStream.range(0, N).parallel().forEach(i -> {
-            DealRecord r1 = nodes[i];
+            Deal r1 = nodes[i];
             double localSum = 0.0;
 
-            // 对称矩阵优化：只计算 j > i
+            // Symmetric Matrix Optimization (j > i)
             for (int j = i + 1; j < N; j++) {
-                DealRecord r2 = nodes[j];
+                Deal r2 = nodes[j];
 
-                // 计算相关性 Rho
                 double rho = getCorrelation(r1, r2);
 
-                // 计算协方差：S1 * S2 * Rho * 2
+                // Covariance * 2 (Symmetric)
                 localSum += (r1.RiskWeightedNetSensitivity * r2.RiskWeightedNetSensitivity * rho) * 2.0;
             }
 
@@ -86,11 +84,11 @@ public class DirectSparkRiskEngine {
     }
 
     /**
-     * 业务规则：直接使用原始字段名进行逻辑判断
+     * Business Rules (Correlation Logic)
      */
-    private double getCorrelation(DealRecord t1, DealRecord t2) {
+    private double getCorrelation(Deal t1, Deal t2) {
         
-        // 规则 1: 完全相同则排除 (Identical Check)
+        // Rule 1: Identical Check
         if (Objects.equals(t1.RiskWeightDerivingCoperID, t2.RiskWeightDerivingCoperID) &&
             Objects.equals(t1.RFTenor, t2.RFTenor) &&
             Objects.equals(t1.CreditQuality, t2.CreditQuality) &&
@@ -100,169 +98,27 @@ public class DirectSparkRiskEngine {
 
         double rho = 1.0;
 
-        // 规则 2: 期限 (Tenor)
+        // Rule 2: Tenor
         if (!Objects.equals(t1.RFTenor, t2.RFTenor)) {
             rho *= 0.9;
         }
 
-        // 规则 3: 评级 (Quality)
+        // Rule 3: Credit Quality
         if (!Objects.equals(t1.CreditQuality, t2.CreditQuality)) {
             rho *= 0.8;
         }
 
-        // 规则 4: 主体相关性 (Issuer / Parent / Index)
+        // Rule 4: Issuer / Parent
         if (Objects.equals(t1.RiskWeightDerivingCoperID, t2.RiskWeightDerivingCoperID)) {
-            // Same Issuer
-            // rho *= 1.0;
+            // Same Issuer -> 1.0
         } 
         else if (Objects.equals(t1.UltimateParentIdentifier, t2.UltimateParentIdentifier) 
-                 && t1.UltimateParentIdentifier != null) { // 简单判空
-            // Same Parent
+                 && t1.UltimateParentIdentifier != null) {
+            // Same Parent -> 0.9
             rho *= 0.9;
         } 
         else {
-            // Different Name
-            rho *= 0.5;
-        }
-
-        return rho;
-    }
-}
-
-
-
-Here is the refined code with English comments only. I have preserved the exact structure and variable names to ensure seamless integration with your Spark Dataset.
-
-Java
-import org.apache.spark.sql.Dataset;
-import org.apache.spark.sql.Row;
-import java.util.List;
-import java.util.ArrayList;
-import java.util.Objects;
-import java.util.concurrent.atomic.DoubleAdder;
-import java.util.stream.IntStream;
-
-public class DirectSparkRiskEngine {
-
-    // 1. Data Structure Definition: Field names match your Spark DataFrame column names exactly.
-    // This avoids the need for complex field mapping logic.
-    public record DealRecord(
-        String RiskWeightDerivingCoperID, // Maps to Issuer ID
-        String UltimateParentIdentifier,  // Maps to Ultimate Parent ID
-        String RFTenor,                   // Maps to Tenor (e.g., "3M", "1Y")
-        String CreditQuality,             // Maps to Credit Quality (e.g., "IG")
-        boolean IsQualifiedIndex,         // Maps to Index Flag
-        double RiskWeightedNetSensitivity // Maps to the aggregated sensitivity amount
-    ) {}
-
-    /**
-     * Public Interface: Accepts your Spark Dataset directly.
-     */
-    public double run(Dataset<Row> inputDataset) {
-        // Step 1: Collect data from Spark to Driver memory.
-        // (Assumption: Data is already aggregated to ~10k-20k rows, which is safe for memory)
-        List<Row> rows = inputDataset.collectAsList();
-        
-        // Step 2: Convert to Java Objects (Mapping).
-        // Using row.getAs("OriginalColumnName") to maintain compatibility with your input schema.
-        List<DealRecord> records = new ArrayList<>(rows.size());
-        for (Row r : rows) {
-            records.add(new DealRecord(
-                r.getAs("RiskWeightDerivingCoperID"),
-                r.getAs("UltimateParentIdentifier"),
-                r.getAs("RFTenor"),
-                r.getAs("CreditQuality"),
-                // Handle potential type mismatch (Boolean vs String representation)
-                r.get(r.fieldIndex("IsQualifiedIndex")) instanceof Boolean ? 
-                    r.getAs("IsQualifiedIndex") : Boolean.parseBoolean(r.getAs("IsQualifiedIndex").toString()),
-                // Handle numeric type mismatch (Double vs BigDecimal/Decimal)
-                ((Number) r.getAs("RiskWeightedNetSensitivity")).doubleValue() 
-            ));
-        }
-
-        // Step 3: Start the core calculation.
-        return calculateCore(records);
-    }
-
-    /**
-     * Core Calculation Logic: Multi-threading + Symmetric Matrix Optimization + Raw String Comparison.
-     */
-    private double calculateCore(List<DealRecord> recordList) {
-        // Convert List to Array for optimal CPU cache locality (faster than List access).
-        DealRecord[] nodes = recordList.toArray(new DealRecord[0]);
-        int N = nodes.length;
-
-        // Atomic adder for thread-safe accumulation without locking overhead.
-        DoubleAdder totalVariance = new DoubleAdder();
-
-        // Parallel Stream: Leverage multi-core CPU architecture.
-        IntStream.range(0, N).parallel().forEach(i -> {
-            DealRecord r1 = nodes[i];
-            double localSum = 0.0;
-
-            // Symmetric Matrix Optimization: Only calculate the upper triangle (j > i).
-            // This reduces the computational load by 50%.
-            for (int j = i + 1; j < N; j++) {
-                DealRecord r2 = nodes[j];
-
-                // Calculate Correlation (Rho) based on business rules.
-                double rho = getCorrelation(r1, r2);
-
-                // Calculate Covariance Contribution: S1 * S2 * Rho * 2
-                // Multiply by 2.0 to account for the symmetric lower triangle (j < i).
-                localSum += (r1.RiskWeightedNetSensitivity * r2.RiskWeightedNetSensitivity * rho) * 2.0;
-            }
-
-            // Accumulate local thread results to the global counter.
-            if (localSum != 0.0) {
-                totalVariance.add(localSum);
-            }
-        });
-
-        // Return the square root of total variance (Risk Capital).
-        return Math.sqrt(totalVariance.sum());
-    }
-
-    /**
-     * Business Rules: Implements correlation logic using original field names.
-     */
-    private double getCorrelation(DealRecord t1, DealRecord t2) {
-        
-        // Rule 1: Identical Check (SQL Lines 11-15)
-        // If all key attributes are identical, correlation is forced to 0 (excluded from cross-term sum).
-        if (Objects.equals(t1.RiskWeightDerivingCoperID, t2.RiskWeightDerivingCoperID) &&
-            Objects.equals(t1.RFTenor, t2.RFTenor) &&
-            Objects.equals(t1.CreditQuality, t2.CreditQuality) &&
-            Objects.equals(t1.UltimateParentIdentifier, t2.UltimateParentIdentifier)) {
-            return 0.0;
-        }
-
-        double rho = 1.0;
-
-        // Rule 2: Tenor Correlation
-        // If Tenors are different -> Apply 0.9 factor
-        if (!Objects.equals(t1.RFTenor, t2.RFTenor)) {
-            rho *= 0.9;
-        }
-
-        // Rule 3: Credit Quality Correlation
-        // If Credit Qualities are different -> Apply 0.8 factor
-        if (!Objects.equals(t1.CreditQuality, t2.CreditQuality)) {
-            rho *= 0.8;
-        }
-
-        // Rule 4: Issuer / Parent / Index Correlation
-        if (Objects.equals(t1.RiskWeightDerivingCoperID, t2.RiskWeightDerivingCoperID)) {
-            // Same Issuer -> Correlation remains 1.0 (no reduction)
-            // rho *= 1.0;
-        } 
-        else if (Objects.equals(t1.UltimateParentIdentifier, t2.UltimateParentIdentifier) 
-                 && t1.UltimateParentIdentifier != null) { // Null check for safety
-            // Same Ultimate Parent (but Different Issuer) -> Apply 0.9 factor
-            rho *= 0.9;
-        } 
-        else {
-            // Different Name / Unrelated -> Apply Base correlation 0.5
+            // Different -> 0.5
             rho *= 0.5;
         }
 
