@@ -1,6 +1,39 @@
 FX risk refers to the risk associated with fluctuations in foreign exchange rates. 
 In the context of SA-CVA, FX risk factors are used to determine the potential credit exposure of a derivative transaction due to changes in exchange rates.
 
+Deal(Row r) {
+                // [FIX]: Use String.valueOf() to handle cases where ID fields are Integers in the data
+                this.AggLevel = safeString(r.getAs("AggLevel"));
+                this.AggLevelValue = safeString(r.getAs("AggLevelValue"));
+                this.CreditQuality = safeString(r.getAs("CreditQuality"));
+                this.Regime = safeString(r.getAs("Regime"));
+                
+                // [FIX]: Specifically fixing RFBucket cast error here
+                this.RFBucket = safeString(r.getAs("RFBucket"));
+                
+                this.RFTenor = safeString(r.getAs("RFTenor"));
+                this.RiskClass = safeString(r.getAs("RiskClass"));
+                this.RiskWeightDerivingCoperID = safeString(r.getAs("RiskWeightDerivingCoperID"));
+                this.ScenarioType = safeString(r.getAs("ScenarioType"));
+                this.UltimateParentIdentifier = safeString(r.getAs("UltimateParentIdentifier"));
+
+                // Parse Boolean safely
+                Object idxObj = r.getAs("IsQualifiedIndex");
+                this.IsQualifiedIndex = (idxObj instanceof Boolean) 
+                    ? (Boolean) idxObj 
+                    : Boolean.parseBoolean(String.valueOf(idxObj));
+
+                // Parse Numeric fields safely
+                this.RiskWeightedCvaSensitivity = parseDoubleSafe(r.getAs("RiskWeightedCvaSensitivity"));
+                this.RiskWeightedHedgeSensitivity = parseDoubleSafe(r.getAs("RiskWeightedHedgeSensitivity"));
+                this.RiskWeightedNetSensitivity = parseDoubleSafe(r.getAs("RiskWeightedNetSensitivity"));
+            }
+
+            // Helper: Safely convert any Object (Integer, Long, String) to String
+            private String safeString(Object val) {
+                return val == null ? null : String.valueOf(val);
+            }
+
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.RowFactory;
