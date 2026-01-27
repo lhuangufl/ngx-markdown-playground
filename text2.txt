@@ -1,6 +1,22 @@
 FX risk refers to the risk associated with fluctuations in foreign exchange rates. 
 In the context of SA-CVA, FX risk factors are used to determine the potential credit exposure of a derivative transaction due to changes in exchange rates.
 
+import org.apache.spark.sql.Dataset;
+import org.apache.spark.sql.Row;
+import org.apache.spark.sql.RowFactory;
+import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.types.DataTypes;
+import org.apache.spark.sql.types.StructField;
+import org.apache.spark.sql.types.StructType;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.concurrent.atomic.DoubleAdder;
+import java.util.stream.IntStream;
+
 
 class Deal {
             // Attributes matching the input Schema
