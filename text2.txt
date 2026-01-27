@@ -2,6 +2,208 @@ FX risk refers to the risk associated with fluctuations in foreign exchange rate
 In the context of SA-CVA, FX risk factors are used to determine the potential credit exposure of a derivative transaction due to changes in exchange rates.
 
 
+class Deal {
+            // Attributes matching the input Schema
+            final String AggLevel;
+            final String AggLevelValue;
+            final String CreditQuality;
+            final String Regime;
+            final String RFBucket;
+            final String RFTenor;
+            final String RiskClass;
+            final String RiskWeightDerivingCoperID;
+            final String ScenarioType;
+            final String UltimateParentIdentifier;
+            final boolean IsQualifiedIndex;
+            
+            // Numeric Sensitivities
+            final double RiskWeightedCvaSensitivity;
+            final double RiskWeightedHedgeSensitivity;
+            final double RiskWeightedNetSensitivity;
+
+            // Constructor: Parses Row data safely
+            Deal(Row r) {
+                this.AggLevel = r.getAs("AggLevel");
+                this.AggLevelValue = r.getAs("AggLevelValue");
+                this.CreditQuality = r.getAs("CreditQuality");
+                this.Regime = r.getAs("Regime");
+                this.RFBucket = r.getAs("RFBucket");
+                this.RFTenor = r.getAs("RFTenor");
+                this.RiskClass = r.getAs("RiskClass");
+                this.RiskWeightDerivingCoperID = r.getAs("RiskWeightDerivingCoperID");
+                this.ScenarioType = r.getAs("ScenarioType");
+                this.UltimateParentIdentifier = r.getAs("UltimateParentIdentifier");
+
+                // Parse Boolean safely
+                Object idxObj = r.getAs("IsQualifiedIndex");
+                this.IsQualifiedIndex = (idxObj instanceof Boolean) 
+                    ? (Boolean) idxObj 
+                    : Boolean.parseBoolean(String.valueOf(idxObj));
+
+                // Parse Numeric fields safely (handles BigDecimal/Double/String)
+                this.RiskWeightedCvaSensitivity = parseDoubleSafe(r.getAs("RiskWeightedCvaSensitivity"));
+                this.RiskWeightedHedgeSensitivity = parseDoubleSafe(r.getAs("RiskWeightedHedgeSensitivity"));
+                this.RiskWeightedNetSensitivity = parseDoubleSafe(r.getAs("RiskWeightedNetSensitivity"));
+            }
+
+            // Helper to handle Spark numeric type polymorphism
+            private double parseDoubleSafe(Object val) {
+                if (val == null) return 0.0;
+                if (val instanceof Number) return ((Number) val).doubleValue();
+                try {
+                    return Double.parseDouble(val.toString());
+                } catch (NumberFormatException e) {
+                    return 0.0;
+                }
+            }
+
+            // Correlation Logic: Calculates 'rho' between this deal and another deal
+            double correlationWith(Deal other) {
+                // Rule 1: Identity Check
+                // If attributes are strictly identical, return 0.0 to exclude self-correlation 
+                // in the cross-term loop (though the loop j>i handles index, this handles duplicates).
+                if (Objects.equals(this.RiskWeightDerivingCoperID, other.RiskWeightDerivingCoperID) &&
+                    Objects.equals(this.RFTenor, other.RFTenor) &&
+                    Objects.equals(this.CreditQuality, other.CreditQuality) &&
+                    Objects.equals(this.UltimateParentIdentifier, other.UltimateParentIdentifier)) {
+                    return 0.0;
+                }
+
+                double rho = 1.0;
+
+                // Rule 2: Tenor Mismatch
+                if (!Objects.equals(this.RFTenor, other.RFTenor)) {
+                    rho *= 0.9;
+                }
+
+                // Rule 3: Credit Quality Mismatch
+                if (!Objects.equals(this.CreditQuality, other.CreditQuality)) {
+                    rho *= 0.8;
+                }
+
+                // Rule 4: Issuer / Parent Relationship
+                if (Objects.equals(this.RiskWeightDerivingCoperID, other.RiskWeightDerivingCoperID)) {
+                    // Same Issuer -> 1.0
+                } 
+                else if (Objects.equals(this.UltimateParentIdentifier, other.UltimateParentIdentifier) 
+                         && this.UltimateParentIdentifier != null) {
+                    // Same Parent (Different Issuer) -> 0.9
+                    rho *= 0.9;
+                } 
+                else {
+                    // Unrelated -> 0.5
+                    rho *= 0.5;
+                }
+                return rho;
+            }
+        }
+
+        // =====================================================================
+        // 2. Data Ingestion (Spark -> Java Heap)
+        // =====================================================================
+        // Attempt to find the input dataset (defaulting to "INPUT_DATA" or first available)
+        String inputKey = dsMap.containsKey("INPUT_DATA") ? "INPUT_DATA" : dsMap.keySet().stream().findFirst().orElse(null);
+        if (inputKey == null) throw new RuntimeException("No Input Dataset found in dsMap");
+
+        Dataset<Row> inputDataset = dsMap.get(inputKey);
+        List<Row> rows = inputDataset.collectAsList();
+
+        // Convert Rows to Deal objects
+        List<Deal> deals = new ArrayList<>(rows.size());
+        for (Row r : rows) {
+            deals.add(new Deal(r));
+        }
+
+        // =====================================================================
+        // 3. Core Calculation (High Performance Kernel)
+        // =====================================================================
+        Deal[] nodes = deals.toArray(new Deal[0]);
+        int N = nodes.length;
+
+        // Accumulators for the three specific terms
+        DoubleAdder accPoweredNetRws = new DoubleAdder();             // Term 1
+        DoubleAdder accSumSumCorrelatedSensitivity = new DoubleAdder(); // Term 2
+        DoubleAdder accPoweredHedgeRws = new DoubleAdder();           // Term 3
+
+        // Parallel Stream Execution
+        IntStream.range(0, N).parallel().forEach(i -> {
+            Deal r1 = nodes[i];
+
+            // Term 1: PoweredNetRws (Sum of Squared Net Sensitivities)
+            // Formula: Sum(WS_net^2)
+            accPoweredNetRws.add(r1.RiskWeightedNetSensitivity * r1.RiskWeightedNetSensitivity);
+
+            // Term 3: SUM_PoweredHedgeRws (Sum of Squared Hedge Sensitivities)
+            // Formula: Sum(WS_hedge^2)
+            // Note: The R factor (0.01) is usually applied later or here depending on requirement.
+            // Based on the variable name "SUM_Powered...", we calculate the raw sum of squares here.
+            accPoweredHedgeRws.add(r1.RiskWeightedHedgeSensitivity * r1.RiskWeightedHedgeSensitivity);
+
+            // Term 2: SUM_SUM_CorrelatedSensitivity (Cross Terms)
+            // Formula: Sum(Sum(Rho * WS_k * WS_l)) where k != l
+            double localCrossSum = 0.0;
+            
+            // Optimization: Iterate only Upper Triangle (j > i)
+            for (int j = i + 1; j < N; j++) {
+                Deal r2 = nodes[j];
+                
+                double rho = r1.correlationWith(r2);
+                
+                // Multiply by 2.0 to account for the symmetric Lower Triangle (i > j)
+                localCrossSum += (r1.RiskWeightedNetSensitivity * r2.RiskWeightedNetSensitivity * rho) * 2.0;
+            }
+            
+            if (localCrossSum != 0.0) {
+                accSumSumCorrelatedSensitivity.add(localCrossSum);
+            }
+        });
+
+        // =====================================================================
+        // 4. Result Packaging
+        // =====================================================================
+        double resultTerm1 = accPoweredNetRws.sum();
+        double resultTerm2 = accSumSumCorrelatedSensitivity.sum();
+        double resultTerm3 = accPoweredHedgeRws.sum();
+
+        // Create a single row with the 3 terms
+        Row resultRow = RowFactory.create(resultTerm1, resultTerm2, resultTerm3);
+        List<Row> resultList = Collections.singletonList(resultRow);
+
+        // Define Output Schema
+        StructType schema = DataTypes.createStructType(new StructField[]{
+            DataTypes.createStructField("PoweredNetRws", DataTypes.DoubleType, false),
+            DataTypes.createStructField("SUM_SUM_CorrelatedSensitivity", DataTypes.DoubleType, false),
+            DataTypes.createStructField("SUM_PoweredHedgeRws", DataTypes.DoubleType, false)
+        });
+
+        return spark.createDataFrame(resultList, schema);
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import java.util.List;
