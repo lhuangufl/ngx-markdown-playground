@@ -1,3 +1,186 @@
+import org.apache.spark.sql.Dataset;
+import org.apache.spark.sql.Row;
+import org.apache.spark.sql.RowFactory;
+import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.types.DataTypes;
+import org.apache.spark.sql.types.StructField;
+import org.apache.spark.sql.types.StructType;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+
+public class FrtbCorrDataProcessor {
+
+    /**
+     * Process method to generate CORR_DATA based on input Sensitivities.
+     */
+    public Dataset<Row> process(SparkSession spark, Map<String, Dataset<Row>> dsMap) {
+
+        // =====================================================================
+        // 1. Constants & Global Parameters (From Image 2 Context)
+        // =====================================================================
+        // These represent the "global.CSR_..." variables seen in the flow designer
+        final double RHO_DIFF_TENOR = 0.99; // Example high correlation for different tenors
+        final double RHO_DIFF_BASIS = 0.50; // Example medium correlation for different basis/types
+        
+        // Scaling factors for High/Low/Medium scenarios (From Image 2 formulas)
+        final double CORRELATION_LOW_SCALE = 0.75;  // Example assumption
+        final double CORRELATION_HIGH_SCALE = 1.25; // Example assumption
+        final double CORRELATION_MEDIUM_SCALE = 1.0;
+
+        // =====================================================================
+        // 2. Define Local Inner Class (RiskFactor Node)
+        // =====================================================================
+        class RiskFactor {
+            final String Regime;
+            final String RiskClass;
+            final String RiskBucket;
+            final String RiskFactorScenarioFamily;
+            final String RiskFactorTenor;
+            final String RiskFactorType;
+            final String IssuerId;
+            final String GeneratedName; // Simulates the CONCAT logic in Image 2
+
+            RiskFactor(Row r) {
+                this.Regime = safeString(r.getAs("REGIME"));
+                this.RiskClass = safeString(r.getAs("RISK_CLASS"));
+                this.RiskBucket = safeString(r.getAs("RISK_BUCKET"));
+                this.RiskFactorScenarioFamily = safeString(r.getAs("RISK_FACTOR_SCENARIO_FAMILY"));
+                this.RiskFactorTenor = safeString(r.getAs("RISK_FACTOR_TENOR"));
+                this.RiskFactorType = safeString(r.getAs("RISK_FACTOR_TYPE"));
+                this.IssuerId = safeString(r.getAs("ISSUER_ID"));
+
+                // Logic from Image 2: CONCAT(ISSUER_ID, '_', TYPE, '_', TENOR...)
+                // Simplifying format_number for Java
+                this.GeneratedName = this.IssuerId + "_" + this.RiskFactorType + "_" + this.RiskFactorTenor;
+            }
+
+            private String safeString(Object val) {
+                return val == null ? "" : String.valueOf(val);
+            }
+        }
+
+        // =====================================================================
+        // 3. Data Ingestion (Simulating "WITH T AS SELECT DISTINCT...")
+        // =====================================================================
+        // We need SBM_DELTA_VEGA_SENSITIVITIES as input
+        String inputKey = dsMap.containsKey("SBM_DELTA_VEGA_SENSITIVITIES") ? "SBM_DELTA_VEGA_SENSITIVITIES" : dsMap.keySet().iterator().next();
+        Dataset<Row> inputDataset = dsMap.get(inputKey);
+        SparkSession activeSpark = inputDataset.sparkSession();
+
+        // Perform the "SELECT DISTINCT" logic from the SQL Image
+        Dataset<Row> distinctFactors = inputDataset.select(
+                "REGIME", "RISK_CLASS", "RISK_BUCKET", 
+                "RISK_FACTOR_SCENARIO_FAMILY", "RISK_FACTOR_TENOR", 
+                "RISK_FACTOR_TYPE", "ISSUER_ID"
+        ).distinct();
+
+        List<Row> rows = distinctFactors.collectAsList();
+        List<RiskFactor> factors = new ArrayList<>(rows.size());
+        for (Row r : rows) {
+            factors.add(new RiskFactor(r));
+        }
+
+        // =====================================================================
+        // 4. Core Calculation (Self-Join / Cartesian Product)
+        // =====================================================================
+        // The SQL performs a JOIN T T1 USING (REGIME, CLASS, BUCKET, FAMILY)
+        // This effectively creates a matrix for every bucket.
+        
+        // We use a synchronized list because we are adding to it from a parallel stream
+        List<Row> resultRows = Collections.synchronizedList(new ArrayList<>());
+        
+        RiskFactor[] nodes = factors.toArray(new RiskFactor[0]);
+        int N = nodes.length;
+
+        // Parallel execution for performance
+        IntStream.range(0, N).parallel().forEach(i -> {
+            RiskFactor t1 = nodes[i];
+            
+            for (int j = 0; j < N; j++) {
+                RiskFactor t2 = nodes[j];
+
+                // 4.1 Join Condition (From SQL: USING REGIME, RISK_CLASS, RISK_BUCKET, FAMILY)
+                // We only calculate correlations if they belong to the same group
+                boolean isSameGroup = Objects.equals(t1.Regime, t2.Regime) &&
+                                      Objects.equals(t1.RiskClass, t2.RiskClass) &&
+                                      Objects.equals(t1.RiskBucket, t2.RiskBucket) &&
+                                      Objects.equals(t1.RiskFactorScenarioFamily, t2.RiskFactorScenarioFamily);
+
+                if (isSameGroup) {
+                    // 4.2 Calculate Base Correlation (Simulating logic inferred from 'diff tenor' fields)
+                    double rho = 1.0;
+
+                    if (Objects.equals(t1.GeneratedName, t2.GeneratedName)) {
+                        // Identity
+                        rho = 1.0;
+                    } else if (Objects.equals(t1.IssuerId, t2.IssuerId) && 
+                               Objects.equals(t1.RiskFactorType, t2.RiskFactorType) &&
+                               !Objects.equals(t1.RiskFactorTenor, t2.RiskFactorTenor)) {
+                        // Same Issuer/Type, Different Tenor -> High correlation
+                        rho = RHO_DIFF_TENOR; 
+                    } else {
+                        // Different Basis/Type -> Lower correlation
+                        rho = RHO_DIFF_BASIS;
+                    }
+
+                    // 4.3 Apply FRTB Formulas (From Image 2)
+                    // CORRELATION_LOW = MAX(((2 * CORRELATION) - 1), (CORRELATION * scale))
+                    double term1 = (2 * rho) - 1;
+                    double term2 = rho * CORRELATION_LOW_SCALE;
+                    double corrLow = Math.max(term1, term2);
+
+                    // CORRELATION_HIGH = MIN(CORRELATION * scale, 1.0)
+                    double corrHigh = Math.min(rho * CORRELATION_HIGH_SCALE, 1.0);
+
+                    // CORRELATION_MEDIUM = MIN(CORRELATION * scale, 1.0)
+                    double corrMed = Math.min(rho * CORRELATION_MEDIUM_SCALE, 1.0);
+
+                    // 4.4 Build Output Row
+                    // Selecting T.* and T1 attributes as per SQL
+                    resultRows.add(RowFactory.create(
+                        t1.Regime,
+                        t1.RiskClass,
+                        t1.RiskBucket,
+                        t1.RiskFactorScenarioFamily,
+                        t1.GeneratedName, // RISK_FACTOR_NAME_1
+                        t2.GeneratedName, // RISK_FACTOR_NAME_2 (Matched via Join)
+                        corrLow,          // CORRELATION_LOW
+                        corrMed,          // CORRELATION_MEDIUM
+                        corrHigh          // CORRELATION_HIGH
+                    ));
+                }
+            }
+        });
+
+        // =====================================================================
+        // 5. Result Packaging
+        // =====================================================================
+        StructType schema = DataTypes.createStructType(new StructField[]{
+            DataTypes.createStructField("REGIME", DataTypes.StringType, false),
+            DataTypes.createStructField("RISK_CLASS", DataTypes.StringType, false),
+            DataTypes.createStructField("RISK_BUCKET", DataTypes.StringType, false),
+            DataTypes.createStructField("RISK_FACTOR_SCENARIO_FAMILY", DataTypes.StringType, false),
+            DataTypes.createStructField("RISK_FACTOR_NAME_1", DataTypes.StringType, false),
+            DataTypes.createStructField("RISK_FACTOR_NAME_2", DataTypes.StringType, false),
+            DataTypes.createStructField("CORRELATION_LOW", DataTypes.DoubleType, false),
+            DataTypes.createStructField("CORRELATION_MEDIUM", DataTypes.DoubleType, false),
+            DataTypes.createStructField("CORRELATION_HIGH", DataTypes.DoubleType, false)
+        });
+
+        return activeSpark.createDataFrame(resultRows, schema);
+    }
+}
+
+
+
+
+
 FX risk refers to the risk associated with fluctuations in foreign exchange rates. 
 In the context of SA-CVA, FX risk factors are used to determine the potential credit exposure of a derivative transaction due to changes in exchange rates.
 
