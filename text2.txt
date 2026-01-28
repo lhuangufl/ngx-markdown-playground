@@ -1,3 +1,225 @@
+// =====================================================================
+// 1. Data Ingestion & Pre-processing
+// =====================================================================
+
+// 1.1 Load Sensitivities (The main trade data)
+Dataset<Row> sensDs = dsMap.get("SBM_DELTA_VEGA_SENSITIVITIES");
+if (sensDs == null) throw new RuntimeException("SBM_DELTA_VEGA_SENSITIVITIES dataset missing");
+List<Row> sensRows = sensDs.collectAsList();
+
+// 1.2 Load Correlations (The lookup table)
+Dataset<Row> corrDs = dsMap.get("CORR_DATA");
+if (corrDs == null) throw new RuntimeException("CORR_DATA dataset missing");
+List<Row> corrRows = corrDs.collectAsList();
+
+// =====================================================================
+// 2. Build Correlation Lookup Map (Performance Optimization)
+// =====================================================================
+// Key: Combined string of dimensions + Name1 + Name2
+// Value: double[] {Low, Medium, High}
+Map<String, double[]> correlationMap = new HashMap<>();
+
+for (Row r : corrRows) {
+    String regime = safeString(r.getAs("REGIME"));
+    String riskClass = safeString(r.getAs("RISK_CLASS"));
+    String bucket = safeString(r.getAs("RISK_BUCKET"));
+    String family = safeString(r.getAs("RISK_FACTOR_SCENARIO_FAMILY"));
+    String name1 = safeString(r.getAs("RISK_FACTOR_NAME_1"));
+    String name2 = safeString(r.getAs("RISK_FACTOR_NAME_2"));
+    
+    double low = parseDoubleSafe(r.getAs("CORRELATION_LOW"));
+    double med = parseDoubleSafe(r.getAs("CORRELATION_MEDIUM"));
+    double high = parseDoubleSafe(r.getAs("CORRELATION_HIGH"));
+
+    // Store Forward Direction: Name1 -> Name2
+    String forwardKey = buildCorrKey(regime, riskClass, bucket, family, name1, name2);
+    correlationMap.put(forwardKey, new double[]{low, med, high});
+
+    // Store Reverse Direction: Name2 -> Name1 (Symmetry)
+    // This simplifies lookup later so we don't have to check both orders
+    if (!name1.equals(name2)) {
+        String reverseKey = buildCorrKey(regime, riskClass, bucket, family, name2, name1);
+        correlationMap.put(reverseKey, new double[]{low, med, high});
+    }
+}
+
+// =====================================================================
+// 3. Define Inner Class for Calculation
+// =====================================================================
+class Trade {
+    // Identity Fields
+    final String AggLevel;
+    final String AggLevelValue;
+    final String Regime;
+    final String EntityId; // REPORTING_ENTITY_COPER_ID
+    final String RiskBucket;
+    final String RiskClass;
+    final String Family;
+    final String RiskFactorName;
+    
+    // Numeric
+    final double WeightedSensitivity;
+
+    // Output Accumulators (Mutable)
+    double sumTermMed = 0.0;
+    double sumTermLow = 0.0;
+    double sumTermHigh = 0.0;
+
+    Trade(Row r) {
+        this.AggLevel = safeString(r.getAs("AGGREGATION_LEVEL"));
+        this.AggLevelValue = safeString(r.getAs("AGGREGATION_LEVEL_VALUE"));
+        this.Regime = safeString(r.getAs("REGIME"));
+        this.EntityId = safeString(r.getAs("REPORTING_ENTITY_COPER_ID"));
+        this.RiskBucket = safeString(r.getAs("RISK_BUCKET"));
+        this.RiskClass = safeString(r.getAs("RISK_CLASS"));
+        this.Family = safeString(r.getAs("RISK_FACTOR_SCENARIO_FAMILY"));
+        this.RiskFactorName = safeString(r.getAs("RISK_FACTOR_NAME"));
+        this.WeightedSensitivity = parseDoubleSafe(r.getAs("WEIGHTED_SENSITIVITY"));
+    }
+
+    // Helper to generate a grouping key for the bucket
+    String getBucketKey() {
+        return AggLevel + "|" + AggLevelValue + "|" + Regime + "|" + 
+               EntityId + "|" + RiskBucket + "|" + RiskClass + "|" + Family;
+    }
+}
+
+// =====================================================================
+// 4. Grouping & Matrix Calculation
+// =====================================================================
+
+// 4.1 Convert Rows to Trade Objects
+List<Trade> allTrades = new ArrayList<>(sensRows.size());
+for (Row r : sensRows) {
+    allTrades.add(new Trade(r));
+}
+
+// 4.2 Group by "Bucket" dimensions (Simulating the Join conditions)
+Map<String, List<Trade>> bucketGroups = allTrades.stream()
+    .collect(Collectors.groupingBy(Trade::getBucketKey));
+
+// 4.3 Process each group in parallel
+List<Row> outputRows = Collections.synchronizedList(new ArrayList<>());
+
+bucketGroups.values().parallelStream().forEach(groupTrades -> {
+    
+    Trade[] nodes = groupTrades.toArray(new Trade[0]);
+    int N = nodes.length;
+
+    // Iterate the matrix
+    for (int i = 0; i < N; i++) {
+        Trade t1 = nodes[i];
+        
+        for (int j = 0; j < N; j++) {
+            Trade t2 = nodes[j];
+
+            // Lookup Correlation
+            // Key: REGIME + CLASS + BUCKET + FAMILY + NAME1 + NAME2
+            String key = buildCorrKey(t1.Regime, t1.RiskClass, t1.RiskBucket, t1.Family, t1.RiskFactorName, t2.RiskFactorName);
+            
+            double[] corrs = correlationMap.get(key);
+            
+            // Default Correlation Logic if not found in map:
+            // If Same Name -> 1.0 (Identity), Else -> 0.0 (Conservative fallback)
+            double rhoLow = 0.0, rhoMed = 0.0, rhoHigh = 0.0;
+            
+            if (corrs != null) {
+                rhoLow = corrs[0];
+                rhoMed = corrs[1];
+                rhoHigh = corrs[2];
+            } else if (t1.RiskFactorName.equals(t2.RiskFactorName)) {
+                rhoLow = 1.0; rhoMed = 1.0; rhoHigh = 1.0;
+            }
+
+            // Calculation: Term = Rho * PSI * WS_k * WS_l
+            // Note: We use t1 as "K" and t2 as "L"
+            double baseTerm = PSI * t1.WeightedSensitivity * t2.WeightedSensitivity;
+
+            t1.sumTermLow  += (rhoLow * baseTerm);
+            t1.sumTermMed  += (rhoMed * baseTerm);
+            t1.sumTermHigh += (rhoHigh * baseTerm);
+        }
+    }
+});
+
+// =====================================================================
+// 5. Output Packaging
+// =====================================================================
+// The SQL groups by AggLevel... up to RISK_FACTOR_NAME_1
+// Since our 'Trade' objects accumulated the sums directly, we just map them to Rows.
+
+for (Trade t : allTrades) {
+    outputRows.add(RowFactory.create(
+        t.AggLevel,
+        t.AggLevelValue,
+        t.Regime,
+        t.EntityId,
+        t.RiskBucket,
+        t.RiskClass,
+        t.Family,
+        t.RiskFactorName, // RISK_FACTOR_NAME_1
+        t.sumTermMed,     // TERM_OFF_DIAGONAL_MEDIUM
+        t.sumTermLow,     // TERM_OFF_DIAGONAL_LOW
+        t.sumTermHigh,    // TERM_OFF_DIAGONAL_HIGH
+        t.WeightedSensitivity // MAX(WEIGHTED_SENSITIVITY_K) - effectively same per row
+    ));
+}
+
+// Define Schema matching the SQL "SELECT" statement
+StructType schema = DataTypes.createStructType(new StructField[]{
+    DataTypes.createStructField("AGGREGATION_LEVEL", DataTypes.StringType, false),
+    DataTypes.createStructField("AGGREGATION_LEVEL_VALUE", DataTypes.StringType, false),
+    DataTypes.createStructField("REGIME", DataTypes.StringType, false),
+    DataTypes.createStructField("REPORTING_ENTITY_COPER_ID", DataTypes.StringType, false),
+    DataTypes.createStructField("RISK_BUCKET", DataTypes.StringType, false),
+    DataTypes.createStructField("RISK_CLASS", DataTypes.StringType, false),
+    DataTypes.createStructField("RISK_FACTOR_SCENARIO_FAMILY", DataTypes.StringType, false),
+    DataTypes.createStructField("RISK_FACTOR_NAME", DataTypes.StringType, false),
+    DataTypes.createStructField("TERM_OFF_DIAGONAL_MEDIUM", DataTypes.DoubleType, false),
+    DataTypes.createStructField("TERM_OFF_DIAGONAL_LOW", DataTypes.DoubleType, false),
+    DataTypes.createStructField("TERM_OFF_DIAGONAL_HIGH", DataTypes.DoubleType, false),
+    DataTypes.createStructField("WEIGHTED_SENSITIVITY_K", DataTypes.DoubleType, false)
+});
+
+// Use the SparkSession from input to create DataFrame
+return spark.createDataFrame(outputRows, schema);
+}
+
+// =====================================================================
+// Helper Methods
+// =====================================================================
+
+private String safeString(Object val) {
+return val == null ? "" : String.valueOf(val);
+}
+
+private double parseDoubleSafe(Object val) {
+if (val == null) return 0.0;
+if (val instanceof Number) return ((Number) val).doubleValue();
+try {
+    return Double.parseDouble(val.toString());
+} catch (Exception e) {
+    return 0.0;
+}
+}
+
+private String buildCorrKey(String regime, String riskClass, String bucket, String family, String name1, String name2) {
+// Using a delimiter that won't appear in data, e.g., "||"
+return regime + "||" + riskClass + "||" + bucket + "||" + family + "||" + name1 + "||" + name2;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.RowFactory;
