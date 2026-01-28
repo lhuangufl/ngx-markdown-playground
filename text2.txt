@@ -1,3 +1,39 @@
+for (Row r : corrRows) {
+    String regime = String.valueOf(r.get(r.fieldIndex("REGIME")));
+    String rClass = String.valueOf(r.get(r.fieldIndex("RISK_CLASS")));
+    String bucket = String.valueOf(r.get(r.fieldIndex("RISK_BUCKET")));
+    String family = String.valueOf(r.get(r.fieldIndex("RISK_FACTOR_SCENARIO_FAMILY")));
+    String n1 = String.valueOf(r.get(r.fieldIndex("RISK_FACTOR_NAME_1")));
+    String n2 = String.valueOf(r.get(r.fieldIndex("RISK_FACTOR_NAME_2")));
+    
+    String prefix = regime + "|" + rClass + "|" + bucket + "|" + family + "|";
+    
+    // 提取相关性数值
+    Object lowObj = r.get(r.fieldIndex("CORRELATION_LOW"));
+    Object medObj = r.get(r.fieldIndex("CORRELATION_MEDIUM"));
+    Object highObj = r.get(r.fieldIndex("CORRELATION_HIGH"));
+
+    double[] vals = new double[]{
+        (lowObj instanceof Number) ? ((Number) lowObj).doubleValue() : 0.0,
+        (medObj instanceof Number) ? ((Number) medObj).doubleValue() : 0.0,
+        (highObj instanceof Number) ? ((Number) highObj).doubleValue() : 0.0
+    };
+
+    correlationMap.put(prefix + n1 + "||" + n2, vals);
+    if (!n1.equals(n2)) {
+        correlationMap.put(prefix + n2 + "||" + n1, vals);
+    }
+}
+
+
+
+
+
+
+
+
+
+
 // =====================================================================
 // 1. Define Local Inner Class (Contains its own helpers)
 // =====================================================================
