@@ -1,3 +1,18 @@
+// Static-like helpers inside the local class to ensure scope visibility
+private String sStr(Object val) {
+    return val == null ? "" : String.valueOf(val);
+}
+
+private double pDbl(Object val) {
+    if (val == null) return 0.0;
+    if (val instanceof Number) return ((Number) val).doubleValue();
+    try { return Double.parseDouble(val.toString()); } catch (Exception e) { return 0.0; }
+}
+
+
+
+
+
 // =====================================================================
 // 1. Define Helper Functions as Local Variables (Lambda)
 // =====================================================================
