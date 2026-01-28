@@ -1,95 +1,57 @@
-import org.apache.spark.sql.Dataset;
-import org.apache.spark.sql.Row;
-import org.apache.spark.sql.RowFactory;
-import org.apache.spark.sql.SparkSession;
-import org.apache.spark.sql.types.DataTypes;
-import org.apache.spark.sql.types.StructField;
-import org.apache.spark.sql.types.StructType;
-
-import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.stream.Collectors;
-
 // =====================================================================
-// 1. Data Ingestion & Pre-processing
+// 1. Define Helper Functions as Local Variables (Lambda)
 // =====================================================================
+Function<Object, String> safeString = (val) -> val == null ? "" : String.valueOf(val);
 
-// 1.1 Load Sensitivities (The main trade data)
-Dataset<Row> sensDs = dsMap.get("SBM_DELTA_VEGA_SENSITIVITIES");
-if (sensDs == null) throw new RuntimeException("SBM_DELTA_VEGA_SENSITIVITIES dataset missing");
-List<Row> sensRows = sensDs.collectAsList();
-
-// 1.2 Load Correlations (The lookup table)
-Dataset<Row> corrDs = dsMap.get("CORR_DATA");
-if (corrDs == null) throw new RuntimeException("CORR_DATA dataset missing");
-List<Row> corrRows = corrDs.collectAsList();
-
-// =====================================================================
-// 2. Build Correlation Lookup Map (Performance Optimization)
-// =====================================================================
-// Key: Combined string of dimensions + Name1 + Name2
-// Value: double[] {Low, Medium, High}
-Map<String, double[]> correlationMap = new HashMap<>();
-
-for (Row r : corrRows) {
-    String regime = safeString(r.getAs("REGIME"));
-    String riskClass = safeString(r.getAs("RISK_CLASS"));
-    String bucket = safeString(r.getAs("RISK_BUCKET"));
-    String family = safeString(r.getAs("RISK_FACTOR_SCENARIO_FAMILY"));
-    String name1 = safeString(r.getAs("RISK_FACTOR_NAME_1"));
-    String name2 = safeString(r.getAs("RISK_FACTOR_NAME_2"));
-    
-    double low = parseDoubleSafe(r.getAs("CORRELATION_LOW"));
-    double med = parseDoubleSafe(r.getAs("CORRELATION_MEDIUM"));
-    double high = parseDoubleSafe(r.getAs("CORRELATION_HIGH"));
-
-    // Store Forward Direction: Name1 -> Name2
-    String forwardKey = buildCorrKey(regime, riskClass, bucket, family, name1, name2);
-    correlationMap.put(forwardKey, new double[]{low, med, high});
-
-    // Store Reverse Direction: Name2 -> Name1 (Symmetry)
-    // This simplifies lookup later so we don't have to check both orders
-    if (!name1.equals(name2)) {
-        String reverseKey = buildCorrKey(regime, riskClass, bucket, family, name2, name1);
-        correlationMap.put(reverseKey, new double[]{low, med, high});
+Function<Object, Double> parseDoubleSafe = (val) -> {
+    if (val == null) return 0.0;
+    if (val instanceof Number) return ((Number) val).doubleValue();
+    try {
+        return Double.parseDouble(val.toString());
+    } catch (Exception e) {
+        return 0.0;
     }
+};
+
+// Local functional interface for building keys to avoid redundancy
+interface KeyBuilder {
+    String apply(String regime, String riskClass, String bucket, String family, String n1, String n2);
 }
+KeyBuilder buildCorrKey = (regime, riskClass, bucket, family, n1, n2) -> 
+    regime + "||" + riskClass + "||" + bucket + "||" + family + "||" + n1 + "||" + n2;
+
+final double PSI = 1.0; 
 
 // =====================================================================
-// 3. Define Inner Class for Calculation
+// 2. Define Local Inner Class
 // =====================================================================
 class Trade {
-    // Identity Fields
     final String AggLevel;
     final String AggLevelValue;
     final String Regime;
-    final String EntityId; // REPORTING_ENTITY_COPER_ID
+    final String EntityId;
     final String RiskBucket;
     final String RiskClass;
     final String Family;
     final String RiskFactorName;
-    
-    // Numeric
     final double WeightedSensitivity;
 
-    // Output Accumulators (Mutable)
     double sumTermMed = 0.0;
     double sumTermLow = 0.0;
     double sumTermHigh = 0.0;
 
     Trade(Row r) {
-        this.AggLevel = safeString(r.getAs("AGGREGATION_LEVEL"));
-        this.AggLevelValue = safeString(r.getAs("AGGREGATION_LEVEL_VALUE"));
-        this.Regime = safeString(r.getAs("REGIME"));
-        this.EntityId = safeString(r.getAs("REPORTING_ENTITY_COPER_ID"));
-        this.RiskBucket = safeString(r.getAs("RISK_BUCKET"));
-        this.RiskClass = safeString(r.getAs("RISK_CLASS"));
-        this.Family = safeString(r.getAs("RISK_FACTOR_SCENARIO_FAMILY"));
-        this.RiskFactorName = safeString(r.getAs("RISK_FACTOR_NAME"));
-        this.WeightedSensitivity = parseDoubleSafe(r.getAs("WEIGHTED_SENSITIVITY"));
+        this.AggLevel = safeString.apply(r.getAs("AGGREGATION_LEVEL"));
+        this.AggLevelValue = safeString.apply(r.getAs("AGGREGATION_LEVEL_VALUE"));
+        this.Regime = safeString.apply(r.getAs("REGIME"));
+        this.EntityId = safeString.apply(r.getAs("REPORTING_ENTITY_COPER_ID"));
+        this.RiskBucket = safeString.apply(r.getAs("RISK_BUCKET"));
+        this.RiskClass = safeString.apply(r.getAs("RISK_CLASS"));
+        this.Family = safeString.apply(r.getAs("RISK_FACTOR_SCENARIO_FAMILY"));
+        this.RiskFactorName = safeString.apply(r.getAs("RISK_FACTOR_NAME"));
+        this.WeightedSensitivity = parseDoubleSafe.apply(r.getAs("WEIGHTED_SENSITIVITY"));
     }
 
-    // Helper to generate a grouping key for the bucket
     String getBucketKey() {
         return AggLevel + "|" + AggLevelValue + "|" + Regime + "|" + 
                EntityId + "|" + RiskBucket + "|" + RiskClass + "|" + Family;
@@ -97,87 +59,87 @@ class Trade {
 }
 
 // =====================================================================
-// 4. Grouping & Matrix Calculation
+// 3. Data Ingestion & Correlation Map Building
 // =====================================================================
+Dataset<Row> sensDs = dsMap.get("SBM_DELTA_VEGA_SENSITIVITIES");
+Dataset<Row> corrDs = dsMap.get("CORR_DATA");
 
-// 4.1 Convert Rows to Trade Objects
+if (sensDs == null || corrDs == null) throw new RuntimeException("Required datasets missing");
+
+Map<String, double[]> correlationMap = new HashMap<>();
+List<Row> corrRows = corrDs.collectAsList();
+
+for (Row r : corrRows) {
+    String regime = safeString.apply(r.getAs("REGIME"));
+    String rClass = safeString.apply(r.getAs("RISK_CLASS"));
+    String bucket = safeString.apply(r.getAs("RISK_BUCKET"));
+    String family = safeString.apply(r.getAs("RISK_FACTOR_SCENARIO_FAMILY"));
+    String n1 = safeString.apply(r.getAs("RISK_FACTOR_NAME_1"));
+    String n2 = safeString.apply(r.getAs("RISK_FACTOR_NAME_2"));
+    
+    double[] vals = new double[]{
+        parseDoubleSafe.apply(r.getAs("CORRELATION_LOW")),
+        parseDoubleSafe.apply(r.getAs("CORRELATION_MEDIUM")),
+        parseDoubleSafe.apply(r.getAs("CORRELATION_HIGH"))
+    };
+
+    correlationMap.put(buildCorrKey.apply(regime, rClass, bucket, family, n1, n2), vals);
+    if (!n1.equals(n2)) {
+        correlationMap.put(buildCorrKey.apply(regime, rClass, bucket, family, n2, n1), vals);
+    }
+}
+
+// =====================================================================
+// 4. Core Calculation Logic
+// =====================================================================
+List<Row> sensRows = sensDs.collectAsList();
 List<Trade> allTrades = new ArrayList<>(sensRows.size());
 for (Row r : sensRows) {
     allTrades.add(new Trade(r));
 }
 
-// 4.2 Group by "Bucket" dimensions (Simulating the Join conditions)
 Map<String, List<Trade>> bucketGroups = allTrades.stream()
     .collect(Collectors.groupingBy(Trade::getBucketKey));
 
-// 4.3 Process each group in parallel
-List<Row> outputRows = Collections.synchronizedList(new ArrayList<>());
-
 bucketGroups.values().parallelStream().forEach(groupTrades -> {
-    
     Trade[] nodes = groupTrades.toArray(new Trade[0]);
     int N = nodes.length;
 
-    // Iterate the matrix
     for (int i = 0; i < N; i++) {
         Trade t1 = nodes[i];
-        
         for (int j = 0; j < N; j++) {
             Trade t2 = nodes[j];
 
-            // Lookup Correlation
-            // Key: REGIME + CLASS + BUCKET + FAMILY + NAME1 + NAME2
-            String key = buildCorrKey(t1.Regime, t1.RiskClass, t1.RiskBucket, t1.Family, t1.RiskFactorName, t2.RiskFactorName);
-            
+            String key = buildCorrKey.apply(t1.Regime, t1.RiskClass, t1.RiskBucket, t1.Family, t1.RiskFactorName, t2.RiskFactorName);
             double[] corrs = correlationMap.get(key);
             
-            // Default Correlation Logic if not found in map:
-            // If Same Name -> 1.0 (Identity), Else -> 0.0 (Conservative fallback)
-            double rhoLow = 0.0, rhoMed = 0.0, rhoHigh = 0.0;
-            
+            double rLow = 0.0, rMed = 0.0, rHigh = 0.0;
             if (corrs != null) {
-                rhoLow = corrs[0];
-                rhoMed = corrs[1];
-                rhoHigh = corrs[2];
+                rLow = corrs[0]; rMed = corrs[1]; rHigh = corrs[2];
             } else if (t1.RiskFactorName.equals(t2.RiskFactorName)) {
-                rhoLow = 1.0; rhoMed = 1.0; rhoHigh = 1.0;
+                rLow = 1.0; rMed = 1.0; rHigh = 1.0;
             }
 
-            // Calculation: Term = Rho * PSI * WS_k * WS_l
-            // Note: We use t1 as "K" and t2 as "L"
-            double baseTerm = PSI * t1.WeightedSensitivity * t2.WeightedSensitivity;
-
-            t1.sumTermLow  += (rhoLow * baseTerm);
-            t1.sumTermMed  += (rhoMed * baseTerm);
-            t1.sumTermHigh += (rhoHigh * baseTerm);
+            double base = PSI * t1.WeightedSensitivity * t2.WeightedSensitivity;
+            t1.sumTermLow  += (rLow * base);
+            t1.sumTermMed  += (rMed * base);
+            t1.sumTermHigh += (rHigh * base);
         }
     }
 });
 
 // =====================================================================
-// 5. Output Packaging
+// 5. Result Packaging
 // =====================================================================
-// The SQL groups by AggLevel... up to RISK_FACTOR_NAME_1
-// Since our 'Trade' objects accumulated the sums directly, we just map them to Rows.
-
+List<Row> outputRows = new ArrayList<>();
 for (Trade t : allTrades) {
     outputRows.add(RowFactory.create(
-        t.AggLevel,
-        t.AggLevelValue,
-        t.Regime,
-        t.EntityId,
-        t.RiskBucket,
-        t.RiskClass,
-        t.Family,
-        t.RiskFactorName, // RISK_FACTOR_NAME_1
-        t.sumTermMed,     // TERM_OFF_DIAGONAL_MEDIUM
-        t.sumTermLow,     // TERM_OFF_DIAGONAL_LOW
-        t.sumTermHigh,    // TERM_OFF_DIAGONAL_HIGH
-        t.WeightedSensitivity // MAX(WEIGHTED_SENSITIVITY_K) - effectively same per row
+        t.AggLevel, t.AggLevelValue, t.Regime, t.EntityId, t.RiskBucket, 
+        t.RiskClass, t.Family, t.RiskFactorName, 
+        t.sumTermMed, t.sumTermLow, t.sumTermHigh, t.WeightedSensitivity
     ));
 }
 
-// Define Schema matching the SQL "SELECT" statement
 StructType schema = DataTypes.createStructType(new StructField[]{
     DataTypes.createStructField("AGGREGATION_LEVEL", DataTypes.StringType, false),
     DataTypes.createStructField("AGGREGATION_LEVEL_VALUE", DataTypes.StringType, false),
@@ -193,843 +155,4 @@ StructType schema = DataTypes.createStructType(new StructField[]{
     DataTypes.createStructField("WEIGHTED_SENSITIVITY_K", DataTypes.DoubleType, false)
 });
 
-// Use the SparkSession from input to create DataFrame
 return spark.createDataFrame(outputRows, schema);
-}
-
-// =====================================================================
-// Helper Methods
-// =====================================================================
-
-private String safeString(Object val) {
-return val == null ? "" : String.valueOf(val);
-}
-
-private double parseDoubleSafe(Object val) {
-if (val == null) return 0.0;
-if (val instanceof Number) return ((Number) val).doubleValue();
-try {
-    return Double.parseDouble(val.toString());
-} catch (Exception e) {
-    return 0.0;
-}
-}
-
-private String buildCorrKey(String regime, String riskClass, String bucket, String family, String name1, String name2) {
-// Using a delimiter that won't appear in data, e.g., "||"
-return regime + "||" + riskClass + "||" + bucket + "||" + family + "||" + name1 + "||" + name2;
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-import org.apache.spark.sql.Dataset;
-import org.apache.spark.sql.Row;
-import org.apache.spark.sql.RowFactory;
-import org.apache.spark.sql.SparkSession;
-import org.apache.spark.sql.types.DataTypes;
-import org.apache.spark.sql.types.StructField;
-import org.apache.spark.sql.types.StructType;
-
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
-import java.util.stream.Collectors;
-import java.util.stream.IntStream;
-
-public class FrtbCorrDataProcessor {
-
-    /**
-     * Process method to generate CORR_DATA based on input Sensitivities.
-     */
-    public Dataset<Row> process(SparkSession spark, Map<String, Dataset<Row>> dsMap) {
-
-        // =====================================================================
-        // 1. Constants & Global Parameters (From Image 2 Context)
-        // =====================================================================
-        // These represent the "global.CSR_..." variables seen in the flow designer
-        final double RHO_DIFF_TENOR = 0.99; // Example high correlation for different tenors
-        final double RHO_DIFF_BASIS = 0.50; // Example medium correlation for different basis/types
-        
-        // Scaling factors for High/Low/Medium scenarios (From Image 2 formulas)
-        final double CORRELATION_LOW_SCALE = 0.75;  // Example assumption
-        final double CORRELATION_HIGH_SCALE = 1.25; // Example assumption
-        final double CORRELATION_MEDIUM_SCALE = 1.0;
-
-        // =====================================================================
-        // 2. Define Local Inner Class (RiskFactor Node)
-        // =====================================================================
-        class RiskFactor {
-            final String Regime;
-            final String RiskClass;
-            final String RiskBucket;
-            final String RiskFactorScenarioFamily;
-            final String RiskFactorTenor;
-            final String RiskFactorType;
-            final String IssuerId;
-            final String GeneratedName; // Simulates the CONCAT logic in Image 2
-
-            RiskFactor(Row r) {
-                this.Regime = safeString(r.getAs("REGIME"));
-                this.RiskClass = safeString(r.getAs("RISK_CLASS"));
-                this.RiskBucket = safeString(r.getAs("RISK_BUCKET"));
-                this.RiskFactorScenarioFamily = safeString(r.getAs("RISK_FACTOR_SCENARIO_FAMILY"));
-                this.RiskFactorTenor = safeString(r.getAs("RISK_FACTOR_TENOR"));
-                this.RiskFactorType = safeString(r.getAs("RISK_FACTOR_TYPE"));
-                this.IssuerId = safeString(r.getAs("ISSUER_ID"));
-
-                // Logic from Image 2: CONCAT(ISSUER_ID, '_', TYPE, '_', TENOR...)
-                // Simplifying format_number for Java
-                this.GeneratedName = this.IssuerId + "_" + this.RiskFactorType + "_" + this.RiskFactorTenor;
-            }
-
-            private String safeString(Object val) {
-                return val == null ? "" : String.valueOf(val);
-            }
-        }
-
-        // =====================================================================
-        // 3. Data Ingestion (Simulating "WITH T AS SELECT DISTINCT...")
-        // =====================================================================
-        // We need SBM_DELTA_VEGA_SENSITIVITIES as input
-        String inputKey = dsMap.containsKey("SBM_DELTA_VEGA_SENSITIVITIES") ? "SBM_DELTA_VEGA_SENSITIVITIES" : dsMap.keySet().iterator().next();
-        Dataset<Row> inputDataset = dsMap.get(inputKey);
-        SparkSession activeSpark = inputDataset.sparkSession();
-
-        // Perform the "SELECT DISTINCT" logic from the SQL Image
-        Dataset<Row> distinctFactors = inputDataset.select(
-                "REGIME", "RISK_CLASS", "RISK_BUCKET", 
-                "RISK_FACTOR_SCENARIO_FAMILY", "RISK_FACTOR_TENOR", 
-                "RISK_FACTOR_TYPE", "ISSUER_ID"
-        ).distinct();
-
-        List<Row> rows = distinctFactors.collectAsList();
-        List<RiskFactor> factors = new ArrayList<>(rows.size());
-        for (Row r : rows) {
-            factors.add(new RiskFactor(r));
-        }
-
-        // =====================================================================
-        // 4. Core Calculation (Self-Join / Cartesian Product)
-        // =====================================================================
-        // The SQL performs a JOIN T T1 USING (REGIME, CLASS, BUCKET, FAMILY)
-        // This effectively creates a matrix for every bucket.
-        
-        // We use a synchronized list because we are adding to it from a parallel stream
-        List<Row> resultRows = Collections.synchronizedList(new ArrayList<>());
-        
-        RiskFactor[] nodes = factors.toArray(new RiskFactor[0]);
-        int N = nodes.length;
-
-        // Parallel execution for performance
-        IntStream.range(0, N).parallel().forEach(i -> {
-            RiskFactor t1 = nodes[i];
-            
-            for (int j = 0; j < N; j++) {
-                RiskFactor t2 = nodes[j];
-
-                // 4.1 Join Condition (From SQL: USING REGIME, RISK_CLASS, RISK_BUCKET, FAMILY)
-                // We only calculate correlations if they belong to the same group
-                boolean isSameGroup = Objects.equals(t1.Regime, t2.Regime) &&
-                                      Objects.equals(t1.RiskClass, t2.RiskClass) &&
-                                      Objects.equals(t1.RiskBucket, t2.RiskBucket) &&
-                                      Objects.equals(t1.RiskFactorScenarioFamily, t2.RiskFactorScenarioFamily);
-
-                if (isSameGroup) {
-                    // 4.2 Calculate Base Correlation (Simulating logic inferred from 'diff tenor' fields)
-                    double rho = 1.0;
-
-                    if (Objects.equals(t1.GeneratedName, t2.GeneratedName)) {
-                        // Identity
-                        rho = 1.0;
-                    } else if (Objects.equals(t1.IssuerId, t2.IssuerId) && 
-                               Objects.equals(t1.RiskFactorType, t2.RiskFactorType) &&
-                               !Objects.equals(t1.RiskFactorTenor, t2.RiskFactorTenor)) {
-                        // Same Issuer/Type, Different Tenor -> High correlation
-                        rho = RHO_DIFF_TENOR; 
-                    } else {
-                        // Different Basis/Type -> Lower correlation
-                        rho = RHO_DIFF_BASIS;
-                    }
-
-                    // 4.3 Apply FRTB Formulas (From Image 2)
-                    // CORRELATION_LOW = MAX(((2 * CORRELATION) - 1), (CORRELATION * scale))
-                    double term1 = (2 * rho) - 1;
-                    double term2 = rho * CORRELATION_LOW_SCALE;
-                    double corrLow = Math.max(term1, term2);
-
-                    // CORRELATION_HIGH = MIN(CORRELATION * scale, 1.0)
-                    double corrHigh = Math.min(rho * CORRELATION_HIGH_SCALE, 1.0);
-
-                    // CORRELATION_MEDIUM = MIN(CORRELATION * scale, 1.0)
-                    double corrMed = Math.min(rho * CORRELATION_MEDIUM_SCALE, 1.0);
-
-                    // 4.4 Build Output Row
-                    // Selecting T.* and T1 attributes as per SQL
-                    resultRows.add(RowFactory.create(
-                        t1.Regime,
-                        t1.RiskClass,
-                        t1.RiskBucket,
-                        t1.RiskFactorScenarioFamily,
-                        t1.GeneratedName, // RISK_FACTOR_NAME_1
-                        t2.GeneratedName, // RISK_FACTOR_NAME_2 (Matched via Join)
-                        corrLow,          // CORRELATION_LOW
-                        corrMed,          // CORRELATION_MEDIUM
-                        corrHigh          // CORRELATION_HIGH
-                    ));
-                }
-            }
-        });
-
-        // =====================================================================
-        // 5. Result Packaging
-        // =====================================================================
-        StructType schema = DataTypes.createStructType(new StructField[]{
-            DataTypes.createStructField("REGIME", DataTypes.StringType, false),
-            DataTypes.createStructField("RISK_CLASS", DataTypes.StringType, false),
-            DataTypes.createStructField("RISK_BUCKET", DataTypes.StringType, false),
-            DataTypes.createStructField("RISK_FACTOR_SCENARIO_FAMILY", DataTypes.StringType, false),
-            DataTypes.createStructField("RISK_FACTOR_NAME_1", DataTypes.StringType, false),
-            DataTypes.createStructField("RISK_FACTOR_NAME_2", DataTypes.StringType, false),
-            DataTypes.createStructField("CORRELATION_LOW", DataTypes.DoubleType, false),
-            DataTypes.createStructField("CORRELATION_MEDIUM", DataTypes.DoubleType, false),
-            DataTypes.createStructField("CORRELATION_HIGH", DataTypes.DoubleType, false)
-        });
-
-        return activeSpark.createDataFrame(resultRows, schema);
-    }
-}
-
-
-
-
-
-FX risk refers to the risk associated with fluctuations in foreign exchange rates. 
-In the context of SA-CVA, FX risk factors are used to determine the potential credit exposure of a derivative transaction due to changes in exchange rates.
-
-Deal(Row r) {
-                // [FIX]: Use String.valueOf() to handle cases where ID fields are Integers in the data
-                this.AggLevel = safeString(r.getAs("AggLevel"));
-                this.AggLevelValue = safeString(r.getAs("AggLevelValue"));
-                this.CreditQuality = safeString(r.getAs("CreditQuality"));
-                this.Regime = safeString(r.getAs("Regime"));
-                
-                // [FIX]: Specifically fixing RFBucket cast error here
-                this.RFBucket = safeString(r.getAs("RFBucket"));
-                
-                this.RFTenor = safeString(r.getAs("RFTenor"));
-                this.RiskClass = safeString(r.getAs("RiskClass"));
-                this.RiskWeightDerivingCoperID = safeString(r.getAs("RiskWeightDerivingCoperID"));
-                this.ScenarioType = safeString(r.getAs("ScenarioType"));
-                this.UltimateParentIdentifier = safeString(r.getAs("UltimateParentIdentifier"));
-
-                // Parse Boolean safely
-                Object idxObj = r.getAs("IsQualifiedIndex");
-                this.IsQualifiedIndex = (idxObj instanceof Boolean) 
-                    ? (Boolean) idxObj 
-                    : Boolean.parseBoolean(String.valueOf(idxObj));
-
-                // Parse Numeric fields safely
-                this.RiskWeightedCvaSensitivity = parseDoubleSafe(r.getAs("RiskWeightedCvaSensitivity"));
-                this.RiskWeightedHedgeSensitivity = parseDoubleSafe(r.getAs("RiskWeightedHedgeSensitivity"));
-                this.RiskWeightedNetSensitivity = parseDoubleSafe(r.getAs("RiskWeightedNetSensitivity"));
-            }
-
-            // Helper: Safely convert any Object (Integer, Long, String) to String
-            private String safeString(Object val) {
-                return val == null ? null : String.valueOf(val);
-            }
-
-import org.apache.spark.sql.Dataset;
-import org.apache.spark.sql.Row;
-import org.apache.spark.sql.RowFactory;
-import org.apache.spark.sql.SparkSession;
-import org.apache.spark.sql.types.DataTypes;
-import org.apache.spark.sql.types.StructField;
-import org.apache.spark.sql.types.StructType;
-
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
-import java.util.concurrent.atomic.DoubleAdder;
-import java.util.stream.IntStream;
-
-
-class Deal {
-            // Attributes matching the input Schema
-            final String AggLevel;
-            final String AggLevelValue;
-            final String CreditQuality;
-            final String Regime;
-            final String RFBucket;
-            final String RFTenor;
-            final String RiskClass;
-            final String RiskWeightDerivingCoperID;
-            final String ScenarioType;
-            final String UltimateParentIdentifier;
-            final boolean IsQualifiedIndex;
-            
-            // Numeric Sensitivities
-            final double RiskWeightedCvaSensitivity;
-            final double RiskWeightedHedgeSensitivity;
-            final double RiskWeightedNetSensitivity;
-
-            // Constructor: Parses Row data safely
-            Deal(Row r) {
-                this.AggLevel = r.getAs("AggLevel");
-                this.AggLevelValue = r.getAs("AggLevelValue");
-                this.CreditQuality = r.getAs("CreditQuality");
-                this.Regime = r.getAs("Regime");
-                this.RFBucket = r.getAs("RFBucket");
-                this.RFTenor = r.getAs("RFTenor");
-                this.RiskClass = r.getAs("RiskClass");
-                this.RiskWeightDerivingCoperID = r.getAs("RiskWeightDerivingCoperID");
-                this.ScenarioType = r.getAs("ScenarioType");
-                this.UltimateParentIdentifier = r.getAs("UltimateParentIdentifier");
-
-                // Parse Boolean safely
-                Object idxObj = r.getAs("IsQualifiedIndex");
-                this.IsQualifiedIndex = (idxObj instanceof Boolean) 
-                    ? (Boolean) idxObj 
-                    : Boolean.parseBoolean(String.valueOf(idxObj));
-
-                // Parse Numeric fields safely (handles BigDecimal/Double/String)
-                this.RiskWeightedCvaSensitivity = parseDoubleSafe(r.getAs("RiskWeightedCvaSensitivity"));
-                this.RiskWeightedHedgeSensitivity = parseDoubleSafe(r.getAs("RiskWeightedHedgeSensitivity"));
-                this.RiskWeightedNetSensitivity = parseDoubleSafe(r.getAs("RiskWeightedNetSensitivity"));
-            }
-
-            // Helper to handle Spark numeric type polymorphism
-            private double parseDoubleSafe(Object val) {
-                if (val == null) return 0.0;
-                if (val instanceof Number) return ((Number) val).doubleValue();
-                try {
-                    return Double.parseDouble(val.toString());
-                } catch (NumberFormatException e) {
-                    return 0.0;
-                }
-            }
-
-            // Correlation Logic: Calculates 'rho' between this deal and another deal
-            double correlationWith(Deal other) {
-                // Rule 1: Identity Check
-                // If attributes are strictly identical, return 0.0 to exclude self-correlation 
-                // in the cross-term loop (though the loop j>i handles index, this handles duplicates).
-                if (Objects.equals(this.RiskWeightDerivingCoperID, other.RiskWeightDerivingCoperID) &&
-                    Objects.equals(this.RFTenor, other.RFTenor) &&
-                    Objects.equals(this.CreditQuality, other.CreditQuality) &&
-                    Objects.equals(this.UltimateParentIdentifier, other.UltimateParentIdentifier)) {
-                    return 0.0;
-                }
-
-                double rho = 1.0;
-
-                // Rule 2: Tenor Mismatch
-                if (!Objects.equals(this.RFTenor, other.RFTenor)) {
-                    rho *= 0.9;
-                }
-
-                // Rule 3: Credit Quality Mismatch
-                if (!Objects.equals(this.CreditQuality, other.CreditQuality)) {
-                    rho *= 0.8;
-                }
-
-                // Rule 4: Issuer / Parent Relationship
-                if (Objects.equals(this.RiskWeightDerivingCoperID, other.RiskWeightDerivingCoperID)) {
-                    // Same Issuer -> 1.0
-                } 
-                else if (Objects.equals(this.UltimateParentIdentifier, other.UltimateParentIdentifier) 
-                         && this.UltimateParentIdentifier != null) {
-                    // Same Parent (Different Issuer) -> 0.9
-                    rho *= 0.9;
-                } 
-                else {
-                    // Unrelated -> 0.5
-                    rho *= 0.5;
-                }
-                return rho;
-            }
-        }
-
-        // =====================================================================
-        // 2. Data Ingestion (Spark -> Java Heap)
-        // =====================================================================
-        // Attempt to find the input dataset (defaulting to "INPUT_DATA" or first available)
-        String inputKey = dsMap.containsKey("INPUT_DATA") ? "INPUT_DATA" : dsMap.keySet().stream().findFirst().orElse(null);
-        if (inputKey == null) throw new RuntimeException("No Input Dataset found in dsMap");
-
-        Dataset<Row> inputDataset = dsMap.get(inputKey);
-        List<Row> rows = inputDataset.collectAsList();
-
-        // Convert Rows to Deal objects
-        List<Deal> deals = new ArrayList<>(rows.size());
-        for (Row r : rows) {
-            deals.add(new Deal(r));
-        }
-
-        // =====================================================================
-        // 3. Core Calculation (High Performance Kernel)
-        // =====================================================================
-        Deal[] nodes = deals.toArray(new Deal[0]);
-        int N = nodes.length;
-
-        // Accumulators for the three specific terms
-        DoubleAdder accPoweredNetRws = new DoubleAdder();             // Term 1
-        DoubleAdder accSumSumCorrelatedSensitivity = new DoubleAdder(); // Term 2
-        DoubleAdder accPoweredHedgeRws = new DoubleAdder();           // Term 3
-
-        // Parallel Stream Execution
-        IntStream.range(0, N).parallel().forEach(i -> {
-            Deal r1 = nodes[i];
-
-            // Term 1: PoweredNetRws (Sum of Squared Net Sensitivities)
-            // Formula: Sum(WS_net^2)
-            accPoweredNetRws.add(r1.RiskWeightedNetSensitivity * r1.RiskWeightedNetSensitivity);
-
-            // Term 3: SUM_PoweredHedgeRws (Sum of Squared Hedge Sensitivities)
-            // Formula: Sum(WS_hedge^2)
-            // Note: The R factor (0.01) is usually applied later or here depending on requirement.
-            // Based on the variable name "SUM_Powered...", we calculate the raw sum of squares here.
-            accPoweredHedgeRws.add(r1.RiskWeightedHedgeSensitivity * r1.RiskWeightedHedgeSensitivity);
-
-            // Term 2: SUM_SUM_CorrelatedSensitivity (Cross Terms)
-            // Formula: Sum(Sum(Rho * WS_k * WS_l)) where k != l
-            double localCrossSum = 0.0;
-            
-            // Optimization: Iterate only Upper Triangle (j > i)
-            for (int j = i + 1; j < N; j++) {
-                Deal r2 = nodes[j];
-                
-                double rho = r1.correlationWith(r2);
-                
-                // Multiply by 2.0 to account for the symmetric Lower Triangle (i > j)
-                localCrossSum += (r1.RiskWeightedNetSensitivity * r2.RiskWeightedNetSensitivity * rho) * 2.0;
-            }
-            
-            if (localCrossSum != 0.0) {
-                accSumSumCorrelatedSensitivity.add(localCrossSum);
-            }
-        });
-
-        // =====================================================================
-        // 4. Result Packaging
-        // =====================================================================
-        double resultTerm1 = accPoweredNetRws.sum();
-        double resultTerm2 = accSumSumCorrelatedSensitivity.sum();
-        double resultTerm3 = accPoweredHedgeRws.sum();
-
-        // Create a single row with the 3 terms
-        Row resultRow = RowFactory.create(resultTerm1, resultTerm2, resultTerm3);
-        List<Row> resultList = Collections.singletonList(resultRow);
-
-        // Define Output Schema
-        StructType schema = DataTypes.createStructType(new StructField[]{
-            DataTypes.createStructField("PoweredNetRws", DataTypes.DoubleType, false),
-            DataTypes.createStructField("SUM_SUM_CorrelatedSensitivity", DataTypes.DoubleType, false),
-            DataTypes.createStructField("SUM_PoweredHedgeRws", DataTypes.DoubleType, false)
-        });
-
-        return spark.createDataFrame(resultList, schema);
-    }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-import org.apache.spark.sql.Dataset;
-import org.apache.spark.sql.Row;
-import java.util.List;
-import java.util.ArrayList;
-import java.util.Objects;
-import java.util.concurrent.atomic.DoubleAdder;
-import java.util.stream.IntStream;
-
-public class DirectSparkRiskEngine {
-
-    // REPLACEMENT: Use a static class instead of 'record' for Java 8/11 compatibility.
-    // We use 'public final' fields to allow direct access (e.g., deal.RFTenor) similar to struct.
-    public static class Deal {
-        public final String RiskWeightDerivingCoperID;
-        public final String UltimateParentIdentifier;
-        public final String RFTenor;
-        public final String CreditQuality;
-        public final boolean IsQualifiedIndex;
-        public final double RiskWeightedNetSensitivity;
-
-        public Deal(
-            String RiskWeightDerivingCoperID,
-            String UltimateParentIdentifier,
-            String RFTenor,
-            String CreditQuality,
-            boolean IsQualifiedIndex,
-            double RiskWeightedNetSensitivity
-        ) {
-            this.RiskWeightDerivingCoperID = RiskWeightDerivingCoperID;
-            this.UltimateParentIdentifier = UltimateParentIdentifier;
-            this.RFTenor = RFTenor;
-            this.CreditQuality = CreditQuality;
-            this.IsQualifiedIndex = IsQualifiedIndex;
-            this.RiskWeightedNetSensitivity = RiskWeightedNetSensitivity;
-        }
-    }
-
-    /**
-     * Public Interface
-     */
-    public double run(Dataset<Row> inputDataset) {
-        // Step 1: Collect data
-        List<Row> rows = inputDataset.collectAsList();
-        
-        // Step 2: Convert to Java Objects (Deal Class)
-        List<Deal> records = new ArrayList<>(rows.size());
-        for (Row r : rows) {
-            records.add(new Deal(
-                r.getAs("RiskWeightDerivingCoperID"),
-                r.getAs("UltimateParentIdentifier"),
-                r.getAs("RFTenor"),
-                r.getAs("CreditQuality"),
-                // Handle Boolean parsing safety
-                r.get(r.fieldIndex("IsQualifiedIndex")) instanceof Boolean ? 
-                    r.getAs("IsQualifiedIndex") : Boolean.parseBoolean(r.getAs("IsQualifiedIndex").toString()),
-                // Handle Number parsing safety (Double/BigDecimal)
-                ((Number) r.getAs("RiskWeightedNetSensitivity")).doubleValue() 
-            ));
-        }
-
-        // Step 3: Calculate
-        return calculateCore(records);
-    }
-
-    /**
-     * Core Calculation Logic
-     */
-    private double calculateCore(List<Deal> recordList) {
-        // Convert List to Array for performance
-        Deal[] nodes = recordList.toArray(new Deal[0]);
-        int N = nodes.length;
-
-        DoubleAdder totalVariance = new DoubleAdder();
-
-        // Parallel Calculation
-        IntStream.range(0, N).parallel().forEach(i -> {
-            Deal r1 = nodes[i];
-            double localSum = 0.0;
-
-            // Symmetric Matrix Optimization (j > i)
-            for (int j = i + 1; j < N; j++) {
-                Deal r2 = nodes[j];
-
-                double rho = getCorrelation(r1, r2);
-
-                // Covariance * 2 (Symmetric)
-                localSum += (r1.RiskWeightedNetSensitivity * r2.RiskWeightedNetSensitivity * rho) * 2.0;
-            }
-
-            if (localSum != 0.0) {
-                totalVariance.add(localSum);
-            }
-        });
-
-        return Math.sqrt(totalVariance.sum());
-    }
-
-    /**
-     * Business Rules (Correlation Logic)
-     */
-    private double getCorrelation(Deal t1, Deal t2) {
-        
-        // Rule 1: Identical Check
-        if (Objects.equals(t1.RiskWeightDerivingCoperID, t2.RiskWeightDerivingCoperID) &&
-            Objects.equals(t1.RFTenor, t2.RFTenor) &&
-            Objects.equals(t1.CreditQuality, t2.CreditQuality) &&
-            Objects.equals(t1.UltimateParentIdentifier, t2.UltimateParentIdentifier)) {
-            return 0.0;
-        }
-
-        double rho = 1.0;
-
-        // Rule 2: Tenor
-        if (!Objects.equals(t1.RFTenor, t2.RFTenor)) {
-            rho *= 0.9;
-        }
-
-        // Rule 3: Credit Quality
-        if (!Objects.equals(t1.CreditQuality, t2.CreditQuality)) {
-            rho *= 0.8;
-        }
-
-        // Rule 4: Issuer / Parent
-        if (Objects.equals(t1.RiskWeightDerivingCoperID, t2.RiskWeightDerivingCoperID)) {
-            // Same Issuer -> 1.0
-        } 
-        else if (Objects.equals(t1.UltimateParentIdentifier, t2.UltimateParentIdentifier) 
-                 && t1.UltimateParentIdentifier != null) {
-            // Same Parent -> 0.9
-            rho *= 0.9;
-        } 
-        else {
-            // Different -> 0.5
-            rho *= 0.5;
-        }
-
-        return rho;
-    }
-}
-
-
-
-
------------------------
-
-import org.apache.spark.sql.Dataset;
-import org.apache.spark.sql.Row;
-import java.util.List;
-import java.util.ArrayList;
-import java.util.Objects;
-import java.util.concurrent.atomic.DoubleAdder;
-import java.util.stream.IntStream;
-
-public class DirectSparkRiskEngine {
-
-    // Constant R for the Hedge Disallowance Term (Standard Basel III value is 0.01)
-    private static final double R_FACTOR = 0.01;
-
-    // Static class acting as a data carrier
-    // Updated to include ALL attributes from the schema image
-    public static class Deal {
-        // String Fields
-        public final String AggLevel;
-        public final String AggLevelValue;
-        public final String CreditQuality;
-        public final String Regime;
-        public final String RFBucket;
-        public final String RFTenor;
-        public final String RiskClass;
-        public final String RiskWeightDerivingCoperID;
-        public final String ScenarioType;
-        public final String UltimateParentIdentifier;
-        
-        // Boolean Field
-        public final boolean IsQualifiedIndex;
-        
-        // Numeric Fields (Sensitivities)
-        public final double RiskWeightedCvaSensitivity;
-        public final double RiskWeightedHedgeSensitivity;
-        public final double RiskWeightedNetSensitivity;
-
-        public Deal(
-            String AggLevel,
-            String AggLevelValue,
-            String CreditQuality,
-            String Regime,
-            String RFBucket,
-            String RFTenor,
-            String RiskClass,
-            String RiskWeightDerivingCoperID,
-            String ScenarioType,
-            String UltimateParentIdentifier,
-            boolean IsQualifiedIndex,
-            double RiskWeightedCvaSensitivity,
-            double RiskWeightedHedgeSensitivity,
-            double RiskWeightedNetSensitivity
-        ) {
-            this.AggLevel = AggLevel;
-            this.AggLevelValue = AggLevelValue;
-            this.CreditQuality = CreditQuality;
-            this.Regime = Regime;
-            this.RFBucket = RFBucket;
-            this.RFTenor = RFTenor;
-            this.RiskClass = RiskClass;
-            this.RiskWeightDerivingCoperID = RiskWeightDerivingCoperID;
-            this.ScenarioType = ScenarioType;
-            this.UltimateParentIdentifier = UltimateParentIdentifier;
-            this.IsQualifiedIndex = IsQualifiedIndex;
-            this.RiskWeightedCvaSensitivity = RiskWeightedCvaSensitivity;
-            this.RiskWeightedHedgeSensitivity = RiskWeightedHedgeSensitivity;
-            this.RiskWeightedNetSensitivity = RiskWeightedNetSensitivity;
-        }
-    }
-
-    /**
-     * Public Interface: Accepts Spark Dataset
-     */
-    public double run(Dataset<Row> inputDataset) {
-        // Step 1: Collect data from Spark to Driver memory
-        List<Row> rows = inputDataset.collectAsList();
-        
-        // Step 2: Convert to Java Objects (Deal Class) with FULL attributes
-        List<Deal> records = new ArrayList<>(rows.size());
-        for (Row r : rows) {
-            records.add(new Deal(
-                r.getAs("AggLevel"),
-                r.getAs("AggLevelValue"),
-                r.getAs("CreditQuality"),
-                r.getAs("Regime"),
-                r.getAs("RFBucket"),
-                r.getAs("RFTenor"),
-                r.getAs("RiskClass"),
-                r.getAs("RiskWeightDerivingCoperID"),
-                r.getAs("ScenarioType"),
-                r.getAs("UltimateParentIdentifier"),
-                
-                // Handle Boolean parsing safety
-                r.get(r.fieldIndex("IsQualifiedIndex")) instanceof Boolean ? 
-                    r.getAs("IsQualifiedIndex") : Boolean.parseBoolean(r.getAs("IsQualifiedIndex").toString()),
-                
-                // Handle Numeric parsing safety for all sensitivity columns
-                getDouble(r, "RiskWeightedCvaSensitivity"),
-                getDouble(r, "RiskWeightedHedgeSensitivity"),
-                getDouble(r, "RiskWeightedNetSensitivity")
-            ));
-        }
-
-        // Step 3: Calculate Kb
-        return calculateKb(records);
-    }
-
-    /**
-     * Helper to safely extract double from Spark Row regardless of underlying type (BigDecimal, Double, String)
-     */
-    private double getDouble(Row r, String colName) {
-        Object val = r.getAs(colName);
-        if (val == null) return 0.0;
-        if (val instanceof Number) {
-            return ((Number) val).doubleValue();
-        }
-        try {
-            return Double.parseDouble(val.toString());
-        } catch (NumberFormatException e) {
-            return 0.0;
-        }
-    }
-
-    /**
-     * Core Calculation Logic for Kb
-     * Formula: Sqrt( (Sum(WS^2) + Sum(Sum(Rho * WS * WS))) + R * Sum((WS_Hdg)^2) )
-     */
-    private double calculateKb(List<Deal> recordList) {
-        Deal[] nodes = recordList.toArray(new Deal[0]);
-        int N = nodes.length;
-
-        // Term 1: Sum of Squared Net Sensitivities (Diagonal)
-        DoubleAdder term1_DiagonalSum = new DoubleAdder();
-        
-        // Term 2: Correlated Sensitivities (Cross Terms)
-        DoubleAdder term2_CrossSum = new DoubleAdder();
-
-        // Term 3: Sum of Squared Hedge Sensitivities
-        DoubleAdder term3_HedgeSum = new DoubleAdder();
-
-        // Parallel Calculation
-        IntStream.range(0, N).parallel().forEach(i -> {
-            Deal r1 = nodes[i];
-
-            // --- Term 1: Sum(WS_k^2) ---
-            double netSensSq = r1.RiskWeightedNetSensitivity * r1.RiskWeightedNetSensitivity;
-            term1_DiagonalSum.add(netSensSq);
-
-            // --- Term 3: Sum((WS_k_Hdg)^2) ---
-            double hedgeSensSq = r1.RiskWeightedHedgeSensitivity * r1.RiskWeightedHedgeSensitivity;
-            term3_HedgeSum.add(hedgeSensSq);
-
-            // --- Term 2: Sum(Sum(Rho * WS_k * WS_l)) ---
-            // Calculate Upper Triangle (j > i) and multiply by 2
-            double localCrossSum = 0.0;
-            for (int j = i + 1; j < N; j++) {
-                Deal r2 = nodes[j];
-
-                double rho = getCorrelation(r1, r2);
-
-                // Cross terms use Net Sensitivities
-                localCrossSum += (r1.RiskWeightedNetSensitivity * r2.RiskWeightedNetSensitivity * rho) * 2.0;
-            }
-
-            if (localCrossSum != 0.0) {
-                term2_CrossSum.add(localCrossSum);
-            }
-        });
-
-        // Assemble the final formula components
-        double componentA = term1_DiagonalSum.sum() + term2_CrossSum.sum(); // (Diagonal + Cross)
-        double componentB = R_FACTOR * term3_HedgeSum.sum();                // R * Sum(Hedge^2)
-
-        // Final Result: Sqrt( A + B )
-        return Math.sqrt(Math.max(0.0, componentA + componentB));
-    }
-
-    /**
-     * Business Rules (Correlation Logic)
-     */
-    private double getCorrelation(Deal t1, Deal t2) {
-        
-        // Rule 1: Identical Check
-        if (Objects.equals(t1.RiskWeightDerivingCoperID, t2.RiskWeightDerivingCoperID) &&
-            Objects.equals(t1.RFTenor, t2.RFTenor) &&
-            Objects.equals(t1.CreditQuality, t2.CreditQuality) &&
-            Objects.equals(t1.UltimateParentIdentifier, t2.UltimateParentIdentifier)) {
-            return 0.0;
-        }
-
-        double rho = 1.0;
-
-        // Rule 2: Tenor Correlation
-        if (!Objects.equals(t1.RFTenor, t2.RFTenor)) {
-            rho *= 0.9;
-        }
-
-        // Rule 3: Credit Quality Correlation
-        if (!Objects.equals(t1.CreditQuality, t2.CreditQuality)) {
-            rho *= 0.8;
-        }
-
-        // Rule 4: Issuer / Parent Correlation
-        if (Objects.equals(t1.RiskWeightDerivingCoperID, t2.RiskWeightDerivingCoperID)) {
-            // Same Issuer -> 1.0
-        } 
-        else if (Objects.equals(t1.UltimateParentIdentifier, t2.UltimateParentIdentifier) 
-                 && t1.UltimateParentIdentifier != null) {
-            // Same Parent -> 0.9
-            rho *= 0.9;
-        } 
-        else {
-            // Different -> 0.5
-            rho *= 0.5;
-        }
-
-        return rho;
-    }
-}
