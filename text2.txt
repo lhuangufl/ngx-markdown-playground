@@ -1,111 +1,72 @@
-// Get the input dataset
-Dataset<Row> inputDs = dsMap.get("SBM_DELTA_VEGA_SENSITIVITIES");
-if (inputDs == null) throw new RuntimeException("Input missing: SBM_DELTA_VEGA_SENSITIVITIES");
+import org.apache.spark.sql.Dataset;
+import org.apache.spark.sql.Row;
+import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.functions; 
+import scala.collection.JavaConverters; 
 
-// =====================================================================
-// 1. Local Class for Data Transport (Serializable for Cluster Execution)
-// =====================================================================
-class Factor implements Serializable {
-    final String regime, riskClass, riskBucket, family;
-    final String tenor, factorType, issuerId;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Map;
 
-    Factor(Row r, int[] idx) {
-        this.regime = sStr(r.get(idx[0]));
-        this.riskClass = sStr(r.get(idx[1]));
-        this.riskBucket = sStr(r.get(idx[2]));
-        this.family = sStr(r.get(idx[3]));
-        this.tenor = sStr(r.get(idx[4]));
-        this.factorType = sStr(r.get(idx[5]));
-        this.issuerId = sStr(r.get(idx[6]));
-    }
+public class SbmFactorPairingProcessor {
 
-    // Key for Grouping: REGIME, RISK_CLASS, RISK_BUCKET, FAMILY
-    String getJoinKey() {
-        return regime + "|" + riskClass + "|" + riskBucket + "|" + family;
-    }
+    public Dataset<Row> process(SparkSession spark, Map<String, Dataset<Row>> dsMap) {
+        Dataset<Row> inputDs = dsMap.get("SBM_DELTA_VEGA_SENSITIVITIES");
+        if (inputDs == null) throw new RuntimeException("Input missing: SBM_DELTA_VEGA_SENSITIVITIES");
 
-    private String sStr(Object v) { return v == null ? "" : String.valueOf(v); }
+        // 1. Projection & Deduplication
+        // Explicitly select columns to minimize memory usage and ensure index stability.
+        String[] colsOfInterest = {
+            "REGIME", "RISK_CLASS", "RISK_BUCKET", "RISK_FACTOR_SCENARIO_FAMILY",
+            "RISK_FACTOR_TENOR", "RISK_FACTOR_TYPE", "ISSUER_ID"
+        };
+        
+        // Apply .na().fill("") to mimic the original 'sStr()' logic. 
+        // This ensures nulls are treated as empty strings for safe joining.
+        Dataset<Row> distinctFactorsDs = inputDs.selectExpr(colsOfInterest)
+            .na().fill("") 
+            .distinct();
 
-    @Override
-    public boolean equals(Object o) {
-        if (this == o) return true;
-        if (!(o instanceof Factor)) return false;
-        Factor f = (Factor) o;
-        return Objects.equals(regime, f.regime) && Objects.equals(riskClass, f.riskClass) &&
-                Objects.equals(riskBucket, f.riskBucket) && Objects.equals(family, f.family) &&
-                Objects.equals(tenor, f.tenor) && Objects.equals(factorType, f.factorType) &&
-                Objects.equals(issuerId, f.issuerId);
-    }
+        // 2. Self-Join Preparation
+        // Alias the DataFrame to treat it as two separate logical tables (Left and Right).
+        Dataset<Row> left = distinctFactorsDs.alias("L");
+        Dataset<Row> right = distinctFactorsDs.alias("R");
 
-    @Override
-    public int hashCode() {
-        return Objects.hash(regime, riskClass, riskBucket, family, tenor, factorType, issuerId);
+        // 3. Define Join Conditions
+        // These columns correspond to the keys used in the original 'getJoinKey' method.
+        List<String> joinKeys = Arrays.asList(
+            "REGIME", "RISK_CLASS", "RISK_BUCKET", "RISK_FACTOR_SCENARIO_FAMILY"
+        );
+        
+        // Convert Java List to Scala Seq required by the Spark API.
+        scala.collection.Seq<String> joinCols = JavaConverters.asScalaBufferConverter(joinKeys).asScala().toSeq();
+
+        // 4. Execute Distributed Join
+        // This leverages the cluster's power (HashJoin/Shuffle) instead of looping on the Driver.
+        Dataset<Row> joinedDs = left.join(right, joinCols, "inner");
+
+        // 5. Column Selection & Renaming
+        // Reconstruct the output schema to match the original requirements.
+        Dataset<Row> result = joinedDs.select(
+            // Shared Keys (Selecting from Left side)
+            functions.col("L.REGIME"),
+            functions.col("L.RISK_CLASS"),
+            functions.col("L.RISK_BUCKET"),
+            functions.col("L.RISK_FACTOR_SCENARIO_FAMILY"),
+            
+            // Left Side Attributes (T.*)
+            functions.col("L.RISK_FACTOR_TENOR"),
+            functions.col("L.RISK_FACTOR_TYPE"),
+            functions.col("L.ISSUER_ID"),
+            
+            // Right Side Attributes (T1.* -> _1 suffix)
+            // Note: RISK_BUCKET is strictly redundant based on the join key, but included to match schema.
+            functions.col("R.RISK_BUCKET").as("RISK_BUCKET_1"), 
+            functions.col("R.RISK_FACTOR_TENOR").as("RISK_FACTOR_TENOR_1"),
+            functions.col("R.RISK_FACTOR_TYPE").as("RISK_FACTOR_TYPE_1"),
+            functions.col("R.ISSUER_ID").as("ISSUER_ID_1")
+        );
+
+        return result;
     }
 }
-
-// =====================================================================
-// 2. Schema Definition (Encapsulated inside process)
-// =====================================================================
-StructType schema = DataTypes.createStructType(new StructField[]{
-        DataTypes.createStructField("REGIME", DataTypes.StringType, false),
-        DataTypes.createStructField("RISK_CLASS", DataTypes.StringType, false),
-        DataTypes.createStructField("RISK_BUCKET", DataTypes.StringType, false),
-        DataTypes.createStructField("RISK_FACTOR_SCENARIO_FAMILY", DataTypes.StringType, false),
-        DataTypes.createStructField("RISK_FACTOR_TENOR", DataTypes.StringType, false),
-        DataTypes.createStructField("RISK_FACTOR_TYPE", DataTypes.StringType, false),
-        DataTypes.createStructField("ISSUER_ID", DataTypes.StringType, false),
-        // T1 Aliased Columns (Paired Factors)
-        DataTypes.createStructField("RISK_BUCKET_1", DataTypes.StringType, false),
-        DataTypes.createStructField("RISK_FACTOR_TENOR_1", DataTypes.StringType, false),
-        DataTypes.createStructField("RISK_FACTOR_TYPE_1", DataTypes.StringType, false),
-        DataTypes.createStructField("ISSUER_ID_1", DataTypes.StringType, false)
-});
-
-// =====================================================================
-// 3. Distributed Execution Logic
-// =====================================================================
-
-// Cache field indices to avoid repeated schema lookups during mapping
-final int[] idx = {
-        inputDs.schema().fieldIndex("REGIME"),
-        inputDs.schema().fieldIndex("RISK_CLASS"),
-        inputDs.schema().fieldIndex("RISK_BUCKET"),
-        inputDs.schema().fieldIndex("RISK_FACTOR_SCENARIO_FAMILY"),
-        inputDs.schema().fieldIndex("RISK_FACTOR_TENOR"),
-        inputDs.schema().fieldIndex("RISK_FACTOR_TYPE"),
-        inputDs.schema().fieldIndex("ISSUER_ID")
-};
-
-// Step A: Map to Factor objects and apply Global Distinct (SELECT DISTINCT)
-JavaPairRDD<String, Factor> groupedRdd = inputDs.toJavaRDD()
-        .map(r -> new Factor(r, idx))
-        .distinct()
-        .mapToPair(f -> new Tuple2<>(f.getJoinKey(), f));
-
-// Step B: Group by Key (Shuffle) to bring factors of the same bucket together
-JavaPairRDD<String, Iterable<Factor>> bucketGroups = groupedRdd.groupByKey();
-
-// Step C: Cartesian Product within each bucket (Parallel Join)
-JavaPairRDD<Factor, Factor> pairedRdd = bucketGroups.flatMapToPair(tuple -> {
-    List<Tuple2<Factor, Factor>> pairs = new ArrayList<>();
-    List<Factor> group = new ArrayList<>();
-    tuple._2().forEach(group::add);
-
-    // Local N^2 loop on Executor
-    for (Factor t : group) {
-        for (Factor t1 : group) {
-            pairs.add(new Tuple2<>(t, t1));
-        }
-    }
-    return pairs.iterator();
-});
-
-// Step D: Map paired objects to Row objects for DataFrame conversion
-return spark.createDataFrame(
-        pairedRdd.map(p -> RowFactory.create(
-                p._1().regime, p._1().riskClass, p._1().riskBucket, p._1().family,
-                p._1().tenor, p._1().factorType, p._1().issuerId,
-                p._2().riskBucket, p._2().tenor, p._2().factorType, p._2().issuerId
-        )),
-        schema
-);
