@@ -1,23 +1,11 @@
-
-import org.apache.spark.sql.Dataset;
-import org.apache.spark.sql.Row;
-import org.apache.spark.sql.RowFactory;
-import org.apache.spark.sql.SparkSession;
-import org.apache.spark.sql.types.DataTypes;
-import org.apache.spark.sql.types.StructField;
-import org.apache.spark.sql.types.StructType;
-
-import java.util.*;
-import java.util.stream.Collectors;
-
-
+// Get the input dataset
 Dataset<Row> inputDs = dsMap.get("SBM_DELTA_VEGA_SENSITIVITIES");
-if (inputDs == null) throw new RuntimeException("Missing input: SBM_DELTA_VEGA_SENSITIVITIES");
+if (inputDs == null) throw new RuntimeException("Input missing: SBM_DELTA_VEGA_SENSITIVITIES");
 
 // =====================================================================
-// 1. 定义局部类 Factor (对应 CTE T)
+// 1. Local Class for Data Transport (Serializable for Cluster Execution)
 // =====================================================================
-class Factor {
+class Factor implements Serializable {
     final String regime, riskClass, riskBucket, family;
     final String tenor, factorType, issuerId;
 
@@ -31,23 +19,22 @@ class Factor {
         this.issuerId = sStr(r.get(idx[6]));
     }
 
-    // 对应 SQL 中的 USING (REGIME, RISK_CLASS, RISK_BUCKET, RISK_FACTOR_SCENARIO_FAMILY)
+    // Key for Grouping: REGIME, RISK_CLASS, RISK_BUCKET, FAMILY
     String getJoinKey() {
         return regime + "|" + riskClass + "|" + riskBucket + "|" + family;
     }
 
     private String sStr(Object v) { return v == null ? "" : String.valueOf(v); }
 
-    // 重写 equals 和 hashCode 以支持 DISTINCT 效果
     @Override
     public boolean equals(Object o) {
         if (this == o) return true;
-        if (o == null || getClass() != o.getClass()) return false;
-        Factor factor = (Factor) o;
-        return Objects.equals(regime, factor.regime) && Objects.equals(riskClass, factor.riskClass) &&
-               Objects.equals(riskBucket, factor.riskBucket) && Objects.equals(family, factor.family) &&
-               Objects.equals(tenor, factor.tenor) && Objects.equals(factorType, factor.factorType) &&
-               Objects.equals(issuerId, factor.issuerId);
+        if (!(o instanceof Factor)) return false;
+        Factor f = (Factor) o;
+        return Objects.equals(regime, f.regime) && Objects.equals(riskClass, f.riskClass) &&
+                Objects.equals(riskBucket, f.riskBucket) && Objects.equals(family, f.family) &&
+                Objects.equals(tenor, f.tenor) && Objects.equals(factorType, f.factorType) &&
+                Objects.equals(issuerId, f.issuerId);
     }
 
     @Override
@@ -57,58 +44,68 @@ class Factor {
 }
 
 // =====================================================================
-// 2. 提取数据并实现 SELECT DISTINCT (对应 CTE T)
-// =====================================================================
-int[] idx = {
-    inputDs.schema().fieldIndex("REGIME"),
-    inputDs.schema().fieldIndex("RISK_CLASS"),
-    inputDs.schema().fieldIndex("RISK_BUCKET"),
-    inputDs.schema().fieldIndex("RISK_FACTOR_SCENARIO_FAMILY"),
-    inputDs.schema().fieldIndex("RISK_FACTOR_TENOR"),
-    inputDs.schema().fieldIndex("RISK_FACTOR_TYPE"),
-    inputDs.schema().fieldIndex("ISSUER_ID")
-};
-
-// 将所有行转换为 Factor 对象，并利用 Set 实现 DISTINCT
-Set<Factor> distinctFactors = inputDs.collectAsList().stream()
-        .map(r -> new Factor(r, idx))
-        .collect(Collectors.toSet());
-
-// =====================================================================
-// 3. 执行 JOIN T T1 USING (...) 逻辑
-// =====================================================================
-// 按 Join Key 分组，同一组内的因子将进行笛卡尔积配对
-Map<String, List<Factor>> groupedByUsing = distinctFactors.stream()
-        .collect(Collectors.groupingBy(Factor::getJoinKey));
-
-List<Row> outputRows = new ArrayList<>();
-for (List<Factor> group : groupedByUsing.values()) {
-    for (Factor t : group) {      // 对应 T.*
-        for (Factor t1 : group) { // 对应 T1.* (带后缀 1)
-            outputRows.add(RowFactory.create(
-                t.regime, t.riskClass, t.riskBucket, t.family, t.tenor, t.factorType, t.issuerId, // T.*
-                t1.riskBucket, t1.tenor, t1.factorType, t1.issuerId                              // T1 别名列
-            ));
-        }
-    }
-}
-
-// =====================================================================
-// 4. 定义输出 Schema
+// 2. Schema Definition (Encapsulated inside process)
 // =====================================================================
 StructType schema = DataTypes.createStructType(new StructField[]{
-    DataTypes.createStructField("REGIME", DataTypes.StringType, false),
-    DataTypes.createStructField("RISK_CLASS", DataTypes.StringType, false),
-    DataTypes.createStructField("RISK_BUCKET", DataTypes.StringType, false),
-    DataTypes.createStructField("RISK_FACTOR_SCENARIO_FAMILY", DataTypes.StringType, false),
-    DataTypes.createStructField("RISK_FACTOR_TENOR", DataTypes.StringType, false),
-    DataTypes.createStructField("RISK_FACTOR_TYPE", DataTypes.StringType, false),
-    DataTypes.createStructField("ISSUER_ID", DataTypes.StringType, false),
-    // T1 别名列
-    DataTypes.createStructField("RISK_BUCKET_1", DataTypes.StringType, false),
-    DataTypes.createStructField("RISK_FACTOR_TENOR_1", DataTypes.StringType, false),
-    DataTypes.createStructField("RISK_FACTOR_TYPE_1", DataTypes.StringType, false),
-    DataTypes.createStructField("ISSUER_ID_1", DataTypes.StringType, false)
+        DataTypes.createStructField("REGIME", DataTypes.StringType, false),
+        DataTypes.createStructField("RISK_CLASS", DataTypes.StringType, false),
+        DataTypes.createStructField("RISK_BUCKET", DataTypes.StringType, false),
+        DataTypes.createStructField("RISK_FACTOR_SCENARIO_FAMILY", DataTypes.StringType, false),
+        DataTypes.createStructField("RISK_FACTOR_TENOR", DataTypes.StringType, false),
+        DataTypes.createStructField("RISK_FACTOR_TYPE", DataTypes.StringType, false),
+        DataTypes.createStructField("ISSUER_ID", DataTypes.StringType, false),
+        // T1 Aliased Columns (Paired Factors)
+        DataTypes.createStructField("RISK_BUCKET_1", DataTypes.StringType, false),
+        DataTypes.createStructField("RISK_FACTOR_TENOR_1", DataTypes.StringType, false),
+        DataTypes.createStructField("RISK_FACTOR_TYPE_1", DataTypes.StringType, false),
+        DataTypes.createStructField("ISSUER_ID_1", DataTypes.StringType, false)
 });
 
-return spark.createDataFrame(outputRows, schema);
+// =====================================================================
+// 3. Distributed Execution Logic
+// =====================================================================
+
+// Cache field indices to avoid repeated schema lookups during mapping
+final int[] idx = {
+        inputDs.schema().fieldIndex("REGIME"),
+        inputDs.schema().fieldIndex("RISK_CLASS"),
+        inputDs.schema().fieldIndex("RISK_BUCKET"),
+        inputDs.schema().fieldIndex("RISK_FACTOR_SCENARIO_FAMILY"),
+        inputDs.schema().fieldIndex("RISK_FACTOR_TENOR"),
+        inputDs.schema().fieldIndex("RISK_FACTOR_TYPE"),
+        inputDs.schema().fieldIndex("ISSUER_ID")
+};
+
+// Step A: Map to Factor objects and apply Global Distinct (SELECT DISTINCT)
+JavaPairRDD<String, Factor> groupedRdd = inputDs.toJavaRDD()
+        .map(r -> new Factor(r, idx))
+        .distinct()
+        .mapToPair(f -> new Tuple2<>(f.getJoinKey(), f));
+
+// Step B: Group by Key (Shuffle) to bring factors of the same bucket together
+JavaPairRDD<String, Iterable<Factor>> bucketGroups = groupedRdd.groupByKey();
+
+// Step C: Cartesian Product within each bucket (Parallel Join)
+JavaPairRDD<Factor, Factor> pairedRdd = bucketGroups.flatMapToPair(tuple -> {
+    List<Tuple2<Factor, Factor>> pairs = new ArrayList<>();
+    List<Factor> group = new ArrayList<>();
+    tuple._2().forEach(group::add);
+
+    // Local N^2 loop on Executor
+    for (Factor t : group) {
+        for (Factor t1 : group) {
+            pairs.add(new Tuple2<>(t, t1));
+        }
+    }
+    return pairs.iterator();
+});
+
+// Step D: Map paired objects to Row objects for DataFrame conversion
+return spark.createDataFrame(
+        pairedRdd.map(p -> RowFactory.create(
+                p._1().regime, p._1().riskClass, p._1().riskBucket, p._1().family,
+                p._1().tenor, p._1().factorType, p._1().issuerId,
+                p._2().riskBucket, p._2().tenor, p._2().factorType, p._2().issuerId
+        )),
+        schema
+);
