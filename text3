@@ -1,24 +1,27 @@
-import org.apache.spark.api.java.function.FlatMapGroupsFunction;
-import org.apache.spark.api.java.function.MapFunction;
-import org.apache.spark.broadcast.Broadcast;
 import org.apache.spark.sql.Dataset;
-import org.apache.spark.sql.Encoders;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.RowFactory;
 import org.apache.spark.sql.SparkSession;
-import org.apache.spark.sql.catalyst.encoders.RowEncoder;
 import org.apache.spark.sql.types.DataTypes;
 import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
 
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.HashMap;
+import java.util.Objects;
+import java.util.concurrent.atomic.DoubleAdder;
+import java.util.stream.IntStream;
+import java.util.stream.Collectors;
 
 public class SbmStructuredProcessor {
 
     public Dataset<Row> process(SparkSession sparkSession, Map<String, Dataset<Row>> dsMap) {
         
         // =====================================================================
-        // 1. Safety Check & Input Retrieval
+        // 1. Input Retrieval & Safety Check
         // =====================================================================
         Dataset<Row> inputDs = dsMap.get("SBM_DELTA_VEGA_SENSITIVITIES");
         Dataset<Row> corrDs = dsMap.get("DELTA_VEGA_INTRA_BUCKET_RESULT_CORRELATION");
@@ -26,8 +29,9 @@ public class SbmStructuredProcessor {
         if (inputDs == null || corrDs == null) throw new RuntimeException("Missing required datasets");
 
         // =====================================================================
-        // 2. Broadcast Preparation (Driver Side)
+        // 2. Prepare Correlation Lookup (Driver Local Map)
         // =====================================================================
+        // Constraint: Cannot use Broadcast class, so we use a standard local Map.
         List<Row> corrRows = corrDs.select(
             "REGIME", "RISK_CLASS", "RISK_FACTOR_SCENARIO_FAMILY", "RISK_BUCKET",
             "RISK_FACTOR_NAME_1", "RISK_FACTOR_NAME_2",
@@ -35,8 +39,9 @@ public class SbmStructuredProcessor {
         ).collectAsList();
 
         Map<String, double[]> correlationMap = new HashMap<>(corrRows.size());
+        
         for (Row r : corrRows) {
-            // Inline null-safe logic to generate key
+            // Inline null-safe key generation
             String key = (r.isNullAt(0) ? "" : r.get(0).toString().trim()) + "|" +
                          (r.isNullAt(1) ? "" : r.get(1).toString().trim()) + "|" +
                          (r.isNullAt(2) ? "" : r.get(2).toString().trim()) + "|" +
@@ -51,32 +56,128 @@ public class SbmStructuredProcessor {
             });
         }
 
-        final Broadcast<Map<String, double[]>> corrBroadcast = sparkSession.sparkContext().broadcast(
-            correlationMap, scala.reflect.ClassTag$.MODULE$.apply(Map.class)
-        );
+        // =====================================================================
+        // 3. Collect & Group Data (Manual GroupBy)
+        // =====================================================================
+        // Constraint: Cannot use RDD or Dataset functional ops (no MapFunction imported).
+        // Solution: Collect to Driver and group manually using Java Map.
+        List<Row> allInputRows = inputDs.collectAsList();
+        
+        // Indices setup
+        final int idxRegime = inputDs.schema().fieldIndex("REGIME");
+        final int idxRiskClass = inputDs.schema().fieldIndex("RISK_CLASS");
+        final int idxFamily = inputDs.schema().fieldIndex("RISK_FACTOR_SCENARIO_FAMILY");
+        final int idxBucket = inputDs.schema().fieldIndex("RISK_BUCKET");
+        final int idxName = inputDs.schema().fieldIndex("RISK_FACTOR_NAME");
+        final int idxSens = inputDs.schema().fieldIndex("WEIGHTED_SENSITIVITY");
+        final int idxAggLvl = inputDs.schema().fieldIndex("AGGREGATION_LEVEL");
+        final int idxAggVal = inputDs.schema().fieldIndex("AGGREGATION_LEVEL_VALUE");
+        final int idxEntity = inputDs.schema().fieldIndex("REPORTING_ENTITY_COPER_ID");
+
+        Map<String, List<Row>> bucketGroups = new HashMap<>();
+
+        for (Row r : allInputRows) {
+            // Grouping Key: Entity|AggLevel|AggVal|Regime|Class|Family|Bucket
+            String k = (r.isNullAt(idxEntity) ? "" : r.get(idxEntity).toString().trim()) + "|" +
+                       (r.isNullAt(idxAggLvl) ? "" : r.get(idxAggLvl).toString().trim()) + "|" +
+                       (r.isNullAt(idxAggVal) ? "" : r.get(idxAggVal).toString().trim()) + "|" +
+                       (r.isNullAt(idxRegime) ? "" : r.get(idxRegime).toString().trim()) + "|" +
+                       (r.isNullAt(idxRiskClass) ? "" : r.get(idxRiskClass).toString().trim()) + "|" +
+                       (r.isNullAt(idxFamily) ? "" : r.get(idxFamily).toString().trim()) + "|" +
+                       (r.isNullAt(idxBucket) ? "" : r.get(idxBucket).toString().trim());
+
+            bucketGroups.computeIfAbsent(k, x -> new ArrayList<>()).add(r);
+        }
 
         // =====================================================================
-        // 3. Configuration Packing (Serializable State)
+        // 4. Matrix Calculation (Parallel Stream)
         // =====================================================================
-        // Store column indices in a primitive array to pass to inner classes.
-        // Order: [0]Regime, [1]Class, [2]Family, [3]Bucket, [4]Name, [5]Sens, 
-        //        [6]AggLvl, [7]AggVal, [8]EntityId
-        int[] indexConfig = new int[] {
-            inputDs.schema().fieldIndex("REGIME"),
-            inputDs.schema().fieldIndex("RISK_CLASS"),
-            inputDs.schema().fieldIndex("RISK_FACTOR_SCENARIO_FAMILY"),
-            inputDs.schema().fieldIndex("RISK_BUCKET"),
-            inputDs.schema().fieldIndex("RISK_FACTOR_NAME"),
-            inputDs.schema().fieldIndex("WEIGHTED_SENSITIVITY"),
-            inputDs.schema().fieldIndex("AGGREGATION_LEVEL"),
-            inputDs.schema().fieldIndex("AGGREGATION_LEVEL_VALUE"),
-            inputDs.schema().fieldIndex("REPORTING_ENTITY_COPER_ID")
-        };
+        // Thread-safe list to hold final results
+        List<Row> finalResults = Collections.synchronizedList(new ArrayList<>());
+
+        // Iterate over each bucket (Group)
+        // We use bucketGroups.entrySet().parallelStream() to utilize multi-core on Driver
+        bucketGroups.entrySet().parallelStream().forEach(entry -> {
+            List<Row> rows = entry.getValue();
+            int n = rows.size();
+            if (n == 0) return;
+
+            // Context from first row
+            Row first = rows.get(0);
+            String riskClass = first.isNullAt(idxRiskClass) ? "" : first.get(idxRiskClass).toString().trim();
+            boolean isEquity = "EQUITY".equalsIgnoreCase(riskClass) || "CSR_NON_SEC".equalsIgnoreCase(riskClass);
+
+            // Pre-process Arrays
+            String[] names = new String[n];
+            String[] prefixes = new String[n];
+            double[] weights = new double[n];
+
+            for (int i = 0; i < n; i++) {
+                Row r = rows.get(i);
+                weights[i] = r.isNullAt(idxSens) ? 0.0 : ((Number)r.get(idxSens)).doubleValue();
+                String rawName = r.isNullAt(idxName) ? "" : r.get(idxName).toString().trim();
+                names[i] = rawName;
+
+                if (isEquity) {
+                    int lastUnderscore = rawName.lastIndexOf('_');
+                    if (lastUnderscore > 0) {
+                        prefixes[i] = rawName.substring(0, lastUnderscore).trim();
+                    } else {
+                        prefixes[i] = rawName;
+                    }
+                }
+            }
+
+            // Common lookup prefix
+            String commonPrefix = (first.isNullAt(idxRegime) ? "" : first.get(idxRegime).toString().trim()) + "|" +
+                                  riskClass + "|" +
+                                  (first.isNullAt(idxFamily) ? "" : first.get(idxFamily).toString().trim()) + "|" +
+                                  (first.isNullAt(idxBucket) ? "" : first.get(idxBucket).toString().trim()) + "|";
+
+            // N x N Matrix Loop
+            IntStream.range(0, n).forEach(i -> {
+                double sumMed = 0.0;
+                double sumLow = 0.0;
+                double sumHigh = 0.0;
+
+                for (int j = 0; j < n; j++) {
+                    String lookupKey;
+                    if (isEquity) {
+                        lookupKey = commonPrefix + prefixes[i] + "|" + prefixes[j];
+                    } else {
+                        lookupKey = commonPrefix + names[i] + "|" + names[j];
+                    }
+
+                    double[] corrs = correlationMap.get(lookupKey);
+                    if (corrs != null) {
+                        double term = weights[i] * weights[j];
+                        sumMed += term * corrs[0];
+                        sumLow += term * corrs[1];
+                        sumHigh += term * corrs[2];
+                    }
+                }
+
+                // Add to result
+                finalResults.add(RowFactory.create(
+                    first.get(idxAggLvl),
+                    first.get(idxAggVal),
+                    first.get(idxRegime),
+                    first.get(idxEntity),
+                    first.isNullAt(idxBucket) ? "" : first.get(idxBucket).toString().trim(),
+                    first.get(idxRiskClass),
+                    first.get(idxFamily),
+                    names[i],
+                    sumMed,
+                    sumLow,
+                    sumHigh,
+                    weights[i] // WEIGHTED_SENSITIVITY_K
+                ));
+            });
+        });
 
         // =====================================================================
-        // 4. Output Schema Definition
+        // 5. Output Schema & Return
         // =====================================================================
-        // Defined early because it is needed for the RowEncoder in the pipeline
         StructType outSchema = DataTypes.createStructType(new StructField[]{
             DataTypes.createStructField("AGGREGATION_LEVEL", DataTypes.StringType, true),
             DataTypes.createStructField("AGGREGATION_LEVEL_VALUE", DataTypes.StringType, true),
@@ -92,153 +193,7 @@ public class SbmStructuredProcessor {
             DataTypes.createStructField("WEIGHTED_SENSITIVITY_K", DataTypes.DoubleType, false)
         });
 
-        // =====================================================================
-        // 5. Logic Classes (Local Named Classes)
-        // =====================================================================
-        
-        /**
-         * Mapper: Generates the Grouping Key.
-         * Implements MapFunction (Dataset API) instead of PairFunction (RDD API).
-         */
-        class GroupingKeyMapper implements MapFunction<Row, String> {
-            private final int[] idx;
-
-            GroupingKeyMapper(int[] idx) {
-                this.idx = idx;
-            }
-
-            @Override
-            public String call(Row r) {
-                // Generate composite key for grouping
-                return (r.isNullAt(idx[8]) ? "" : r.get(idx[8]).toString().trim()) + "|" + // EntityID
-                       (r.isNullAt(idx[6]) ? "" : r.get(idx[6]).toString().trim()) + "|" + // AggLvl
-                       (r.isNullAt(idx[7]) ? "" : r.get(idx[7]).toString().trim()) + "|" + // AggVal
-                       (r.isNullAt(idx[0]) ? "" : r.get(idx[0]).toString().trim()) + "|" + // Regime
-                       (r.isNullAt(idx[1]) ? "" : r.get(idx[1]).toString().trim()) + "|" + // Class
-                       (r.isNullAt(idx[2]) ? "" : r.get(idx[2]).toString().trim()) + "|" + // Family
-                       (r.isNullAt(idx[3]) ? "" : r.get(idx[3]).toString().trim());        // Bucket
-            }
-        }
-
-        /**
-         * Calculator: Performs N*N Matrix Multiplication per Group.
-         * Implements FlatMapGroupsFunction (Dataset API).
-         */
-        class MatrixCalculator implements FlatMapGroupsFunction<String, Row, Row> {
-            private final int[] idx;
-            private final Broadcast<Map<String, double[]>> broadcast;
-
-            MatrixCalculator(int[] idx, Broadcast<Map<String, double[]>> broadcast) {
-                this.idx = idx;
-                this.broadcast = broadcast;
-            }
-
-            @Override
-            public Iterator<Row> call(String key, Iterator<Row> rowIterator) {
-                // 1. Materialize Iterator to List (Required for nested loop)
-                List<Row> rows = new ArrayList<>();
-                while (rowIterator.hasNext()) {
-                    rows.add(rowIterator.next());
-                }
-
-                int n = rows.size();
-                if (n == 0) return Collections.emptyIterator();
-
-                // 2. Extract Context (From first row)
-                Row first = rows.get(0);
-                String riskClass = first.isNullAt(idx[1]) ? "" : first.get(idx[1]).toString().trim();
-                boolean isEquity = "EQUITY".equalsIgnoreCase(riskClass) || "CSR_NON_SEC".equalsIgnoreCase(riskClass);
-
-                // 3. Pre-process Arrays for fast access
-                String[] names = new String[n];
-                String[] prefixes = new String[n];
-                // Note: suffix/diffIssuer logic removed based on previous requirements for key match
-                double[] weights = new double[n];
-
-                for (int i = 0; i < n; i++) {
-                    Row r = rows.get(i);
-                    // Sensitivity (idx[5])
-                    weights[i] = r.isNullAt(idx[5]) ? 0.0 : ((Number)r.get(idx[5])).doubleValue();
-                    
-                    // Name (idx[4])
-                    String rawName = r.isNullAt(idx[4]) ? "" : r.get(idx[4]).toString().trim();
-                    names[i] = rawName;
-
-                    if (isEquity) {
-                        int lastUnderscore = rawName.lastIndexOf('_');
-                        if (lastUnderscore > 0) {
-                            prefixes[i] = rawName.substring(0, lastUnderscore).trim();
-                        } else {
-                            prefixes[i] = rawName;
-                        }
-                    }
-                }
-
-                Map<String, double[]> lookupData = broadcast.value();
-                
-                // 4. Pre-calculate common lookup key prefix
-                String regime = first.isNullAt(idx[0]) ? "" : first.get(idx[0]).toString().trim();
-                String family = first.isNullAt(idx[2]) ? "" : first.get(idx[2]).toString().trim();
-                String bucket = first.isNullAt(idx[3]) ? "" : first.get(idx[3]).toString().trim();
-                
-                String commonPrefix = regime + "|" + riskClass + "|" + family + "|" + bucket + "|";
-
-                List<Row> results = new ArrayList<>(n);
-
-                // 5. Calculation Loop (N x N)
-                for (int i = 0; i < n; i++) {
-                    double sumMed = 0.0;
-                    double sumLow = 0.0;
-                    double sumHigh = 0.0;
-
-                    for (int j = 0; j < n; j++) {
-                        String lookupKey;
-                        if (isEquity) {
-                            lookupKey = commonPrefix + prefixes[i] + "|" + prefixes[j];
-                        } else {
-                            lookupKey = commonPrefix + names[i] + "|" + names[j];
-                        }
-
-                        double[] corrs = lookupData.get(lookupKey);
-                        if (corrs != null) {
-                            double term = weights[i] * weights[j];
-                            sumMed += term * corrs[0];
-                            sumLow += term * corrs[1];
-                            sumHigh += term * corrs[2];
-                        }
-                    }
-
-                    results.add(RowFactory.create(
-                        first.get(idx[6]), // AggLevel
-                        first.get(idx[7]), // AggVal
-                        first.get(idx[0]), // Regime
-                        first.get(idx[8]), // EntityID
-                        first.isNullAt(idx[3]) ? "" : first.get(idx[3]).toString().trim(), // Bucket (Force String)
-                        first.get(idx[1]), // RiskClass
-                        first.get(idx[2]), // Family
-                        names[i], 
-                        sumMed, 
-                        sumLow, 
-                        sumHigh, 
-                        weights[i] // WEIGHTED_SENSITIVITY_K
-                    ));
-                }
-
-                return results.iterator();
-            }
-        }
-
-        // =====================================================================
-        // 6. Execution Pipeline (Dataset API)
-        // =====================================================================
-        
-        return inputDs
-            // Step 1: Group By Key (Returns KeyValueGroupedDataset)
-            // Uses 'Encoders.STRING()' for the key type
-            .groupByKey(new GroupingKeyMapper(indexConfig), Encoders.STRING())
-            
-            // Step 2: Process Groups (Returns Dataset<Row>)
-            // Uses 'RowEncoder' for the output type
-            .flatMapGroups(new MatrixCalculator(indexConfig, corrBroadcast), RowEncoder.apply(outSchema));
+        // Convert List<Row> back to Dataset<Row>
+        return sparkSession.createDataFrame(finalResults, outSchema);
     }
 }
