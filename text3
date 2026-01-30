@@ -1,19 +1,17 @@
-import org.apache.spark.api.java.JavaPairRDD;
-import org.apache.spark.api.java.JavaRDD;
-import org.apache.spark.api.java.function.FlatMapFunction;
-import org.apache.spark.api.java.function.PairFunction;
+import org.apache.spark.api.java.function.FlatMapGroupsFunction;
+import org.apache.spark.api.java.function.MapFunction;
 import org.apache.spark.broadcast.Broadcast;
 import org.apache.spark.sql.Dataset;
+import org.apache.spark.sql.Encoders;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.RowFactory;
 import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.catalyst.encoders.RowEncoder;
 import org.apache.spark.sql.types.DataTypes;
 import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
-import scala.Tuple2;
 
 import java.util.*;
-import java.util.stream.IntStream;
 
 public class SbmStructuredProcessor {
 
@@ -38,7 +36,7 @@ public class SbmStructuredProcessor {
 
         Map<String, double[]> correlationMap = new HashMap<>(corrRows.size());
         for (Row r : corrRows) {
-            // Inline null-safe logic to avoid helper methods
+            // Inline null-safe logic to generate key
             String key = (r.isNullAt(0) ? "" : r.get(0).toString().trim()) + "|" +
                          (r.isNullAt(1) ? "" : r.get(1).toString().trim()) + "|" +
                          (r.isNullAt(2) ? "" : r.get(2).toString().trim()) + "|" +
@@ -58,13 +56,11 @@ public class SbmStructuredProcessor {
         );
 
         // =====================================================================
-        // 3. Configuration Packing (The "Anti-Closure" Strategy)
+        // 3. Configuration Packing (Serializable State)
         // =====================================================================
-        // We pack all indices into a serializable int[] array.
-        // This array will be passed to inner classes via constructor.
-        // Array Layout:
-        // [0]=Regime, [1]=Class, [2]=Family, [3]=Bucket, [4]=Name, [5]=Sens, 
-        // [6]=AggLvl, [7]=AggVal, [8]=EntityId
+        // Store column indices in a primitive array to pass to inner classes.
+        // Order: [0]Regime, [1]Class, [2]Family, [3]Bucket, [4]Name, [5]Sens, 
+        //        [6]AggLvl, [7]AggVal, [8]EntityId
         int[] indexConfig = new int[] {
             inputDs.schema().fieldIndex("REGIME"),
             inputDs.schema().fieldIndex("RISK_CLASS"),
@@ -74,82 +70,97 @@ public class SbmStructuredProcessor {
             inputDs.schema().fieldIndex("WEIGHTED_SENSITIVITY"),
             inputDs.schema().fieldIndex("AGGREGATION_LEVEL"),
             inputDs.schema().fieldIndex("AGGREGATION_LEVEL_VALUE"),
-            inputDs.schema().fieldIndex("REPORTING_ENTITY_COPER_ID"),
-            inputDs.schema().fieldIndex("EXCLUDED_RISK_BUCKET") // Index 9
+            inputDs.schema().fieldIndex("REPORTING_ENTITY_COPER_ID")
         };
 
         // =====================================================================
-        // 4. Define Logic Classes INSIDE process()
+        // 4. Output Schema Definition
         // =====================================================================
+        // Defined early because it is needed for the RowEncoder in the pipeline
+        StructType outSchema = DataTypes.createStructType(new StructField[]{
+            DataTypes.createStructField("AGGREGATION_LEVEL", DataTypes.StringType, true),
+            DataTypes.createStructField("AGGREGATION_LEVEL_VALUE", DataTypes.StringType, true),
+            DataTypes.createStructField("REGIME", DataTypes.StringType, true),
+            DataTypes.createStructField("REPORTING_ENTITY_COPER_ID", DataTypes.IntegerType, true), 
+            DataTypes.createStructField("RISK_BUCKET", DataTypes.StringType, true),
+            DataTypes.createStructField("RISK_CLASS", DataTypes.StringType, true),
+            DataTypes.createStructField("RISK_FACTOR_SCENARIO_FAMILY", DataTypes.StringType, true),
+            DataTypes.createStructField("RISK_FACTOR_NAME", DataTypes.StringType, true),
+            DataTypes.createStructField("TERM_OFF_DIAGONAL_MEDIUM", DataTypes.DoubleType, false),
+            DataTypes.createStructField("TERM_OFF_DIAGONAL_LOW", DataTypes.DoubleType, false),
+            DataTypes.createStructField("TERM_OFF_DIAGONAL_HIGH", DataTypes.DoubleType, false),
+            DataTypes.createStructField("WEIGHTED_SENSITIVITY_K", DataTypes.DoubleType, false)
+        });
 
+        // =====================================================================
+        // 5. Logic Classes (Local Named Classes)
+        // =====================================================================
+        
         /**
-         * Mapper Class for Grouping.
-         * Defined locally to ensure encapsulation, but uses explicit state (idx array)
-         * to avoid capturing the outer class reference.
+         * Mapper: Generates the Grouping Key.
+         * Implements MapFunction (Dataset API) instead of PairFunction (RDD API).
          */
-        class GroupingMapper implements PairFunction<Row, String, Row> {
+        class GroupingKeyMapper implements MapFunction<Row, String> {
             private final int[] idx;
 
-            // Explicit Constructor: Receives state manually
-            GroupingMapper(int[] idx) {
+            GroupingKeyMapper(int[] idx) {
                 this.idx = idx;
             }
 
             @Override
-            public Tuple2<String, Row> call(Row r) {
-                // Accessing indices via local array 'idx', NOT outer variables
-                String k = (r.isNullAt(idx[8]) ? "" : r.get(idx[8]).toString().trim()) + "|" + // EntityID
-                           (r.isNullAt(idx[6]) ? "" : r.get(idx[6]).toString().trim()) + "|" + // AggLvl
-                           (r.isNullAt(idx[7]) ? "" : r.get(idx[7]).toString().trim()) + "|" + // AggVal
-                           (r.isNullAt(idx[0]) ? "" : r.get(idx[0]).toString().trim()) + "|" + // Regime
-                           (r.isNullAt(idx[1]) ? "" : r.get(idx[1]).toString().trim()) + "|" + // Class
-                           (r.isNullAt(idx[2]) ? "" : r.get(idx[2]).toString().trim()) + "|" + // Family
-                           (r.isNullAt(idx[3]) ? "" : r.get(idx[3]).toString().trim());        // Bucket
-                return new Tuple2<>(k, r);
+            public String call(Row r) {
+                // Generate composite key for grouping
+                return (r.isNullAt(idx[8]) ? "" : r.get(idx[8]).toString().trim()) + "|" + // EntityID
+                       (r.isNullAt(idx[6]) ? "" : r.get(idx[6]).toString().trim()) + "|" + // AggLvl
+                       (r.isNullAt(idx[7]) ? "" : r.get(idx[7]).toString().trim()) + "|" + // AggVal
+                       (r.isNullAt(idx[0]) ? "" : r.get(idx[0]).toString().trim()) + "|" + // Regime
+                       (r.isNullAt(idx[1]) ? "" : r.get(idx[1]).toString().trim()) + "|" + // Class
+                       (r.isNullAt(idx[2]) ? "" : r.get(idx[2]).toString().trim()) + "|" + // Family
+                       (r.isNullAt(idx[3]) ? "" : r.get(idx[3]).toString().trim());        // Bucket
             }
         }
 
         /**
-         * Calculator Class for Matrix Multiplication.
-         * Defined locally. Receives Broadcast and Indices via constructor.
+         * Calculator: Performs N*N Matrix Multiplication per Group.
+         * Implements FlatMapGroupsFunction (Dataset API).
          */
-        class MatrixCalculator implements FlatMapFunction<Tuple2<String, Iterable<Row>>, Row> {
+        class MatrixCalculator implements FlatMapGroupsFunction<String, Row, Row> {
             private final int[] idx;
             private final Broadcast<Map<String, double[]>> broadcast;
 
-            // Explicit Constructor
             MatrixCalculator(int[] idx, Broadcast<Map<String, double[]>> broadcast) {
                 this.idx = idx;
                 this.broadcast = broadcast;
             }
 
             @Override
-            public Iterator<Row> call(Tuple2<String, Iterable<Row>> tuple) {
-                // Materialize rows
+            public Iterator<Row> call(String key, Iterator<Row> rowIterator) {
+                // 1. Materialize Iterator to List (Required for nested loop)
                 List<Row> rows = new ArrayList<>();
-                for (Row r : tuple._2()) {
-                    rows.add(r);
+                while (rowIterator.hasNext()) {
+                    rows.add(rowIterator.next());
                 }
+
                 int n = rows.size();
                 if (n == 0) return Collections.emptyIterator();
 
-                // Context info
+                // 2. Extract Context (From first row)
                 Row first = rows.get(0);
                 String riskClass = first.isNullAt(idx[1]) ? "" : first.get(idx[1]).toString().trim();
                 boolean isEquity = "EQUITY".equalsIgnoreCase(riskClass) || "CSR_NON_SEC".equalsIgnoreCase(riskClass);
 
-                // Pre-process Arrays
+                // 3. Pre-process Arrays for fast access
                 String[] names = new String[n];
                 String[] prefixes = new String[n];
-                String[] suffixes = new String[n];
+                // Note: suffix/diffIssuer logic removed based on previous requirements for key match
                 double[] weights = new double[n];
 
                 for (int i = 0; i < n; i++) {
                     Row r = rows.get(i);
-                    // Handle Sensitivity (idx[5])
+                    // Sensitivity (idx[5])
                     weights[i] = r.isNullAt(idx[5]) ? 0.0 : ((Number)r.get(idx[5])).doubleValue();
                     
-                    // Handle Name (idx[4])
+                    // Name (idx[4])
                     String rawName = r.isNullAt(idx[4]) ? "" : r.get(idx[4]).toString().trim();
                     names[i] = rawName;
 
@@ -157,17 +168,15 @@ public class SbmStructuredProcessor {
                         int lastUnderscore = rawName.lastIndexOf('_');
                         if (lastUnderscore > 0) {
                             prefixes[i] = rawName.substring(0, lastUnderscore).trim();
-                            suffixes[i] = rawName.substring(lastUnderscore + 1).trim();
                         } else {
                             prefixes[i] = rawName;
-                            suffixes[i] = rawName;
                         }
                     }
                 }
 
                 Map<String, double[]> lookupData = broadcast.value();
                 
-                // Pre-calculate common key prefix
+                // 4. Pre-calculate common lookup key prefix
                 String regime = first.isNullAt(idx[0]) ? "" : first.get(idx[0]).toString().trim();
                 String family = first.isNullAt(idx[2]) ? "" : first.get(idx[2]).toString().trim();
                 String bucket = first.isNullAt(idx[3]) ? "" : first.get(idx[3]).toString().trim();
@@ -176,7 +185,7 @@ public class SbmStructuredProcessor {
 
                 List<Row> results = new ArrayList<>(n);
 
-                // Calculation Loop
+                // 5. Calculation Loop (N x N)
                 for (int i = 0; i < n; i++) {
                     double sumMed = 0.0;
                     double sumLow = 0.0;
@@ -204,7 +213,7 @@ public class SbmStructuredProcessor {
                         first.get(idx[7]), // AggVal
                         first.get(idx[0]), // Regime
                         first.get(idx[8]), // EntityID
-                        first.isNullAt(idx[3]) ? "" : first.get(idx[3]).toString().trim(), // Bucket
+                        first.isNullAt(idx[3]) ? "" : first.get(idx[3]).toString().trim(), // Bucket (Force String)
                         first.get(idx[1]), // RiskClass
                         first.get(idx[2]), // Family
                         names[i], 
@@ -220,33 +229,16 @@ public class SbmStructuredProcessor {
         }
 
         // =====================================================================
-        // 5. Execution Pipeline
+        // 6. Execution Pipeline (Dataset API)
         // =====================================================================
         
-        // Pass the 'indexConfig' array to constructor to avoid closure capture
-        JavaPairRDD<String, Iterable<Row>> bucketedRdd = inputDs.toJavaRDD()
-            .mapToPair(new GroupingMapper(indexConfig))
-            .groupByKey();
-
-        // Pass 'indexConfig' and 'corrBroadcast' to constructor
-        JavaRDD<Row> resultRdd = bucketedRdd.flatMap(new MatrixCalculator(indexConfig, corrBroadcast));
-
-        // =====================================================================
-        // 6. Output Schema
-        // =====================================================================
-        StructType outSchema = DataTypes.createStructType(new StructField[]{
-            DataTypes.createStructField("AGGREGATION_LEVEL", DataTypes.StringType, true),
-            DataTypes.createStructField("AGGREGATION_LEVEL_VALUE", DataTypes.StringType, true),
-            DataTypes.createStructField("REGIME", DataTypes.StringType, true),
-            DataTypes.createStructField("REPORTING_ENTITY_COPER_ID", DataTypes.IntegerType, true), 
-            DataTypes.createStructField("RISK_BUCKET", DataTypes.StringType, true),
-            DataTypes.createStructField("RISK_CLASS", DataTypes.StringType, true),
-            DataTypes.createStructField("RISK_FACTOR_SCENARIO_FAMILY", DataTypes.StringType, true),
-            DataTypes.createStructField("RISK_FACTOR_NAME", DataTypes.StringType, true),
-            DataTypes.createStructField("TERM_OFF_DIAGONAL_MEDIUM", DataTypes.DoubleType, false),
-            DataTypes.createStructField("TERM_OFF_DIAGONAL_LOW", DataTypes.DoubleType, false),
-            DataTypes.createStructField("TERM_OFF_DIAGONAL_HIGH", DataTypes.DoubleType, false),
-            DataTypes.createStructField("WEIGHTED_SENSITIVITY_K", DataTypes.DoubleType, false)
-        });
-
-        return sparkSession.createDataFrame(resultRdd, outSchema);
+        return inputDs
+            // Step 1: Group By Key (Returns KeyValueGroupedDataset)
+            // Uses 'Encoders.STRING()' for the key type
+            .groupByKey(new GroupingKeyMapper(indexConfig), Encoders.STRING())
+            
+            // Step 2: Process Groups (Returns Dataset<Row>)
+            // Uses 'RowEncoder' for the output type
+            .flatMapGroups(new MatrixCalculator(indexConfig, corrBroadcast), RowEncoder.apply(outSchema));
+    }
+}
