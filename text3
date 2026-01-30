@@ -1,3 +1,14 @@
+String diffIssuer = "Y"; // 默认不同
+                        if (issuers[i] != null && issuers[j] != null && issuers[i].equals(issuers[j])) {
+                            diffIssuer = "N"; // 相同
+                        }
+                        
+                        // 2. 构造 Key，匹配 Driver 端生成的 "Y|Y" 或 "N|N" 这种格式
+                        // 注意：这里假设相关性表中 Name_1 和 Name_2 的前缀逻辑是一致的
+                        lookupKey = commonPrefix + diffIssuer + "|" + diffIssuer;
+
+
+
 for (Row r : corrRows) {
         String rClass = r.isNullAt(1) ? "" : r.get(1).toString().trim();
         String name1 = r.isNullAt(4) ? "" : r.get(4).toString().trim();
