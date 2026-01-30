@@ -1,229 +1,252 @@
-import org.apache.spark.api.java.JavaSparkContext;
-import org.apache.spark.api.java.function.FlatMapGroupsFunction;
-import org.apache.spark.api.java.function.MapFunction;
+import org.apache.spark.api.java.JavaPairRDD;
+import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.broadcast.Broadcast;
-import org.apache.spark.sql.*;
-import org.apache.spark.sql.catalyst.encoders.RowEncoder;
-import org.apache.spark.sql.types.*;
+import org.apache.spark.sql.Dataset;
+import org.apache.spark.sql.Row;
+import org.apache.spark.sql.RowFactory;
+import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.types.DataTypes;
+import org.apache.spark.sql.types.StructField;
+import org.apache.spark.sql.types.StructType;
+import scala.Tuple2;
 
-// Necessary Java Standard Imports
 import java.util.*;
-import java.util.stream.*;
-import java.util.function.IntFunction; 
-import java.io.Serializable; // Critical for explicit serialization
+import java.util.concurrent.atomic.DoubleAdder;
+import java.util.stream.IntStream;
 
-public Dataset<Row> process(SparkSession spark, Map<String, Dataset<Row>> dsMap) {
+public class SbmStructuredProcessor {
 
-    // =========================================================================
-    // 1. Retrieve Inputs
-    // =========================================================================
-    Dataset<Row> inputDs = dsMap.get("SBM_DELTA_VEGA_SENSITIVITIES");
-    Dataset<Row> correlationDs = dsMap.get("DELTA_VEGA_INTRA_BUCKET_RESULT_CORRELATION");
+    public Dataset<Row> process(SparkSession spark, Map<String, Dataset<Row>> dsMap) {
 
-    if (inputDs == null || correlationDs == null) {
-        throw new RuntimeException("Missing required inputs.");
-    }
+        Dataset<Row> inputDs = dsMap.get("SBM_DELTA_VEGA_SENSITIVITIES");
+        // Using the specific name you mentioned for correlation data
+        Dataset<Row> corrDs = dsMap.get("DELTA_VEGA_INTRA_BUCKET_RESULT_CORRELATION"); 
 
-    // =========================================================================
-    // 2. Prepare Broadcast (Driver Side)
-    // =========================================================================
-    Map<String, List<Row>> localCorrMap = new HashMap<>();
-    List<Row> corrList = correlationDs.collectAsList();
-    
-    for (Row r : corrList) {
-        String reg = (r.getAs("REGIME") == null) ? "" : r.getAs("REGIME").toString().trim();
-        String cls = (r.getAs("RISK_CLASS") == null) ? "" : r.getAs("RISK_CLASS").toString().trim();
-        String fam = (r.getAs("RISK_FACTOR_SCENARIO_FAMILY") == null) ? "" : r.getAs("RISK_FACTOR_SCENARIO_FAMILY").toString().trim();
-        String bkt = (r.getAs("RISK_BUCKET") == null) ? "" : r.getAs("RISK_BUCKET").toString().trim();
+        if (inputDs == null || corrDs == null) throw new RuntimeException("Missing required datasets");
+
+        // =========================================================================
+        // PRE-PROCESSING: Lookup Data Preparation
+        // =========================================================================
+        // We collect correlation rules into a Map. 
+        // Although collectAsList pulls data to the driver, it enables O(1) local lookups 
+        // inside the massive N*N loop later, which is critical for performance.
         
-        String key = reg + "|" + cls + "|" + fam + "|" + bkt;
+        List<Row> corrRows = corrDs.select(
+            "REGIME", "RISK_CLASS", "RISK_FACTOR_SCENARIO_FAMILY", "RISK_BUCKET",
+            "RISK_FACTOR_NAME_1", "RISK_FACTOR_NAME_2", "DIFF_ISSUER",
+            "CORRELATION_MEDIUM", "CORRELATION_LOW", "CORRELATION_HIGH"
+        ).collectAsList();
+
+        Map<String, double[]> correlationMap = new HashMap<>(corrRows.size());
         
-        if (!localCorrMap.containsKey(key)) {
-            localCorrMap.put(key, new ArrayList<>());
+        for (Row r : corrRows) {
+            // Null safety checks
+            String regime = r.isNullAt(0) ? "" : r.getString(0);
+            String rClass = r.isNullAt(1) ? "" : r.getString(1);
+            String family = r.isNullAt(2) ? "" : r.getString(2);
+            String bucket = r.isNullAt(3) ? "" : r.getString(3);
+            String name1  = r.isNullAt(4) ? "" : r.getString(4).trim();
+            String name2  = r.isNullAt(5) ? "" : r.getString(5).trim();
+            // Handling DIFF_ISSUER: In some tables it might be null if not Equity
+            String diffIss = r.isNullAt(6) ? "NULL" : r.getString(6).trim(); 
+            
+            // Construct the unique lookup key
+            // Format: REGIME|CLASS|FAMILY|BUCKET|NAME1|NAME2|DIFF_ISSUER
+            String key = regime + "|" + rClass + "|" + family + "|" + bucket + "|" + 
+                         name1 + "|" + name2 + "|" + diffIss;
+            
+            double[] values = new double[]{
+                r.isNullAt(7) ? 0.0 : r.getDouble(7), // Medium
+                r.isNullAt(8) ? 0.0 : r.getDouble(8), // Low
+                r.isNullAt(9) ? 0.0 : r.getDouble(9)  // High
+            };
+            correlationMap.put(key, values);
         }
-        localCorrMap.get(key).add(r);
-    }
-    
-    JavaSparkContext jsc = new JavaSparkContext(spark.sparkContext());
-    final Broadcast<Map<String, List<Row>>> corrBroadcast = jsc.broadcast(localCorrMap);
 
-    // =========================================================================
-    // 3. Define Output Schema
-    // =========================================================================
-    StructType outputSchema = DataTypes.createStructType(new StructField[]{
-        DataTypes.createStructField("AGGREGATION_LEVEL", DataTypes.StringType, true),
-        DataTypes.createStructField("AGGREGATION_LEVEL_VALUE", DataTypes.StringType, true),
-        DataTypes.createStructField("REGIME", DataTypes.StringType, true),
-        DataTypes.createStructField("REPORTING_ENTITY_COPER_ID", DataTypes.StringType, true),
-        DataTypes.createStructField("RISK_BUCKET", DataTypes.StringType, true),
-        DataTypes.createStructField("RISK_CLASS", DataTypes.StringType, true),
-        DataTypes.createStructField("RISK_FACTOR_SCENARIO_FAMILY", DataTypes.StringType, true),
-        DataTypes.createStructField("RISK_FACTOR_NAME_1", DataTypes.StringType, true),
-        DataTypes.createStructField("EXCLUDED_RISK_BUCKET", DataTypes.StringType, true),
-        DataTypes.createStructField("SUM_TERM_OFF_DIAGONAL_MEDIUM", DataTypes.DoubleType, false),
-        DataTypes.createStructField("SUM_TERM_OFF_DIAGONAL_LOW", DataTypes.DoubleType, false),
-        DataTypes.createStructField("SUM_TERM_OFF_DIAGONAL_HIGH", DataTypes.DoubleType, false),
-        DataTypes.createStructField("MAX_WEIGHTED_SENSITIVITY_K", DataTypes.DoubleType, false)
-    });
+        // Broadcast the map to all executors to avoid network I/O during the loops
+        final Broadcast<Map<String, double[]>> corrBroadcast = spark.sparkContext().broadcast(
+            correlationMap, 
+            scala.reflect.ClassTag$.MODULE$.apply(Map.class)
+        );
 
-    // =========================================================================
-    // 4. Execution Pipeline (Detached Local Class Pattern)
-    // =========================================================================
-    return inputDs
-        .groupByKey(new MapFunction<Row, String>() {
-            @Override
-            public String call(Row r) throws Exception {
-                String id = (r.getAs("REPORTING_ENTITY_COPER_ID") == null) ? "" : r.getAs("REPORTING_ENTITY_COPER_ID").toString().trim();
-                String reg = (r.getAs("REGIME") == null) ? "" : r.getAs("REGIME").toString().trim();
-                String bkt = (r.getAs("RISK_BUCKET") == null) ? "" : r.getAs("RISK_BUCKET").toString().trim();
-                return id + "|" + reg + "|" + bkt;
-            }
-        }, Encoders.STRING())
+        // =========================================================================
+        // MAIN PROCESSING FLOW
+        // =========================================================================
         
-        .flatMapGroups(new FlatMapGroupsFunction<String, Row, Row>() {
-            @Override
-            public Iterator<Row> call(String key, Iterator<Row> iterator) throws Exception {
+        // Capture field indices for performance (avoiding schema lookup inside loops)
+        final int iReg = inputDs.schema().fieldIndex("REGIME");
+        final int iCls = inputDs.schema().fieldIndex("RISK_CLASS");
+        final int iFam = inputDs.schema().fieldIndex("RISK_FACTOR_SCENARIO_FAMILY");
+        final int iBkt = inputDs.schema().fieldIndex("RISK_BUCKET");
+        final int iName = inputDs.schema().fieldIndex("RISK_FACTOR_NAME");
+        final int iSens = inputDs.schema().fieldIndex("WEIGHTED_SENSITIVITY");
+        
+        // Fields for final output construction
+        final int iAggLvl = inputDs.schema().fieldIndex("AGGREGATION_LEVEL");
+        final int iAggVal = inputDs.schema().fieldIndex("AGGREGATION_LEVEL_VALUE");
+        final int iRepId = inputDs.schema().fieldIndex("REPORTING_ENTITY_COPER_ID");
+        final int iExcBkt = inputDs.schema().fieldIndex("EXCLUDED_RISK_BUCKET");
+
+        // -------------------------------------------------------------------------
+        // Step 1: Input & Grouping (Prepare for Self-Join)
+        // -------------------------------------------------------------------------
+        // Transform Dataset to PairRDD and Group by Bucket ID.
+        // This ensures all rows belonging to the same bucket are on the same executor node.
+        JavaPairRDD<String, Row> bucketedRdd = inputDs.toJavaRDD().mapToPair(r -> {
+            String k = (r.isNullAt(iReg)?"":r.getString(iReg)) + "|" +
+                       (r.isNullAt(iCls)?"":r.getString(iCls)) + "|" +
+                       (r.isNullAt(iFam)?"":r.getString(iFam)) + "|" +
+                       (r.isNullAt(iBkt)?"":r.getString(iBkt));
+            return new Tuple2<>(k, r);
+        }).groupByKey();
+
+        // Execution Phase inside Executor
+        JavaRDD<Row> resultRdd = bucketedRdd.map(tuple -> {
+            
+            // Materialize the iterator into a List for random access
+            List<Row> rows = new ArrayList<>();
+            tuple._2().forEach(rows::add);
+            int n = rows.size();
+            
+            if (n == 0) return null;
+
+            // Get shared context from the first row (Dimensions)
+            Row first = rows.get(0);
+            String regime = first.isNullAt(iReg) ? "" : first.getString(iReg);
+            String rClass = first.isNullAt(iCls) ? "" : first.getString(iCls);
+            String family = first.isNullAt(iFam) ? "" : first.getString(iFam);
+            String bucket = first.isNullAt(iBkt) ? "" : first.getString(iBkt);
+            
+            boolean isEquity = "EQUITY".equals(rClass) || "CSR_NON_SEC".equals(rClass);
+
+            // ---------------------------------------------------------------------
+            // Step 2: Enrich Keys (Pre-calculation)
+            // ---------------------------------------------------------------------
+            // Before entering the heavy loop, we extract/calculate all components 
+            // needed for the Lookup Key. This avoids string manipulation inside the N*N loop.
+            
+            String[] names = new String[n];
+            String[] prefixes = new String[n]; // For Equity logic
+            String[] suffixes = new String[n]; // For Equity logic
+            double[] weights = new double[n];
+            
+            for (int i = 0; i < n; i++) {
+                Row r = rows.get(i);
+                weights[i] = r.isNullAt(iSens) ? 0.0 : r.getDouble(iSens);
+                String rawName = r.isNullAt(iName) ? " " : r.getString(iName);
+                names[i] = rawName;
                 
-                // ---------------------------------------------------------
-                // A. Define Serializable Helper Classes
-                //    (Explicitly implementing Serializable)
-                // ---------------------------------------------------------
-                
-                // Tool: Pure logic, serializable
-                class Tool implements Serializable {
-                    String s(Object o) { return (o == null) ? "" : o.toString().trim(); }
-                    double d(Object o) { return (o instanceof Number) ? ((Number) o).doubleValue() : 0.0; }
-                    String extractIssuer(String name) {
-                        if (name == null || !name.contains("_")) return name == null ? "" : name;
-                        return name.substring(name.lastIndexOf("_") + 1);
-                    }
+                if (isEquity) {
+                    // Pre-calculate prefix and suffix based on underscore logic
+                    int firstUnderscore = rawName.indexOf('_');
+                    int lastUnderscore = rawName.lastIndexOf('_');
+                    
+                    prefixes[i] = (firstUnderscore > 0) ? rawName.substring(0, firstUnderscore).trim() : rawName.trim();
+                    suffixes[i] = (lastUnderscore >= 0) ? rawName.substring(lastUnderscore + 1) : rawName;
+                } else {
+                    prefixes[i] = "";
+                    suffixes[i] = "";
                 }
-                final Tool tool = new Tool();
-
-                // FactorNode: Data container, serializable
-                class FactorNode implements Serializable {
-                    final String name, issuer, excludedBucket;
-                    final double sens;
-                    FactorNode(Row r) {
-                        this.name = tool.s(r.getAs("RISK_FACTOR_NAME"));
-                        this.issuer = tool.extractIssuer(this.name);
-                        this.excludedBucket = tool.s(r.getAs("EXCLUDED_RISK_BUCKET"));
-                        this.sens = tool.d(r.getAs("WEIGHTED_SENSITIVITY"));
-                    }
-                }
-
-                // ---------------------------------------------------------
-                // B. Data Materialization
-                // ---------------------------------------------------------
-                List<Row> metaHolder = new ArrayList<>();
-                List<FactorNode> nodes = new ArrayList<>();
-                while (iterator.hasNext()) {
-                    Row r = iterator.next();
-                    if (metaHolder.isEmpty()) metaHolder.add(r);
-                    nodes.add(new FactorNode(r));
-                }
-
-                if (nodes.isEmpty()) return Collections.emptyIterator();
-                final Row metaRow = metaHolder.get(0);
-
-                // ---------------------------------------------------------
-                // C. Prepare Context Data
-                // ---------------------------------------------------------
-                String rClass = tool.s(metaRow.getAs("RISK_CLASS"));
-                boolean isEquity = "EQUITY".equalsIgnoreCase(rClass) || "CSR_NON_SEC".equalsIgnoreCase(rClass);
-                
-                String lookupKey = tool.s(metaRow.getAs("REGIME")) + "|" + rClass + "|" + 
-                                   tool.s(metaRow.getAs("RISK_FACTOR_SCENARIO_FAMILY")) + "|" + 
-                                   tool.s(metaRow.getAs("RISK_BUCKET"));
-                
-                List<Row> rules = corrBroadcast.value().getOrDefault(lookupKey, Collections.emptyList());
-
-                // ---------------------------------------------------------
-                // D. The "Detached" RowMapper Class
-                //    (This is the fix: A named local class that takes state via constructor)
-                // ---------------------------------------------------------
-                class RowMapper implements IntFunction<Row>, Serializable {
-                    // All state is passed in explicitly, preventing implicit outer class capture
-                    private final List<FactorNode> nodes;
-                    private final List<Row> rules;
-                    private final Row metaRow;
-                    private final Tool tool;
-                    private final boolean isEquity;
-
-                    public RowMapper(List<FactorNode> nodes, List<Row> rules, Row metaRow, Tool tool, boolean isEquity) {
-                        this.nodes = nodes;
-                        this.rules = rules;
-                        this.metaRow = metaRow;
-                        this.tool = tool;
-                        this.isEquity = isEquity;
-                    }
-
-                    @Override
-                    public Row apply(int i) {
-                        FactorNode t1 = nodes.get(i);
-                        double sumMed = 0.0, sumLow = 0.0, sumHigh = 0.0;
-
-                        for (FactorNode t2 : nodes) {
-                            // Logic: Issuer Diff
-                            String diffIssuer = "N";
-                            if (isEquity && !t1.issuer.equals(t2.issuer)) {
-                                diffIssuer = "Y";
-                            }
-
-                            // Logic: Lookup
-                            Row match = null;
-                            for (Row rule : rules) {
-                                if (!isEquity) {
-                                    if (tool.s(rule.getAs("RISK_FACTOR_NAME_1")).equals(t1.name) &&
-                                        tool.s(rule.getAs("RISK_FACTOR_NAME_2")).equals(t2.name)) {
-                                        match = rule; 
-                                        break;
-                                    }
-                                } else {
-                                    String marker = tool.s(rule.getAs("RISK_FACTOR_NAME_1")).trim();
-                                    if (!marker.isEmpty() && marker.startsWith(diffIssuer)) {
-                                        match = rule;
-                                        break;
-                                    }
-                                }
-                            }
-
-                            // Logic: Aggregate
-                            if (match != null) {
-                                double term = t1.sens * t2.sens;
-                                sumMed += tool.d(match.getAs("CORRELATION_MEDIUM")) * term;
-                                sumLow += tool.d(match.getAs("CORRELATION_LOW")) * term;
-                                sumHigh += tool.d(match.getAs("CORRELATION_HIGH")) * term;
-                            }
-                        }
-
-                        return RowFactory.create(
-                            tool.s(metaRow.getAs("AGGREGATION_LEVEL")),
-                            tool.s(metaRow.getAs("AGGREGATION_LEVEL_VALUE")),
-                            tool.s(metaRow.getAs("REGIME")),
-                            tool.s(metaRow.getAs("REPORTING_ENTITY_COPER_ID")),
-                            tool.s(metaRow.getAs("RISK_BUCKET")),
-                            tool.s(metaRow.getAs("RISK_CLASS")),
-                            tool.s(metaRow.getAs("RISK_FACTOR_SCENARIO_FAMILY")),
-                            t1.name,
-                            t1.excludedBucket,
-                            sumMed, sumLow, sumHigh,
-                            t1.sens
-                        );
-                    }
-                }
-
-                // ---------------------------------------------------------
-                // E. Parallel Execution using the Named Mapper
-                // ---------------------------------------------------------
-                // Pass all dependencies explicitly to the constructor
-                RowMapper mapper = new RowMapper(nodes, rules, metaRow, tool, isEquity);
-
-                return IntStream.range(0, nodes.size())
-                    .parallel()
-                    .mapToObj(mapper) // Use the safe, detached mapper instance
-                    .collect(Collectors.toList())
-                    .iterator();
             }
-        }, RowEncoder.apply(outputSchema));
+
+            // Thread-safe accumulators for parallel stream
+            DoubleAdder sumMed = new DoubleAdder();
+            DoubleAdder sumLow = new DoubleAdder();
+            DoubleAdder sumHigh = new DoubleAdder();
+            
+            Map<String, double[]> lookupData = corrBroadcast.value();
+            final double globalPsi = 1.0; 
+
+            // ---------------------------------------------------------------------
+            // Step 3: Self Join & Lookup (Parallel Execution)
+            // ---------------------------------------------------------------------
+            // We use IntStream.parallel() to leverage multi-core CPUs on the executor.
+            
+            IntStream.range(0, n).parallel().forEach(i -> {
+                double wK = weights[i];
+                String name1 = names[i];
+                String prefix1 = prefixes[i];
+                String suffix1 = suffixes[i];
+
+                // Inner loop (N iterations)
+                for (int j = 0; j < n; j++) {
+                    
+                    // A. Determine the Lookup Key based on business rules
+                    String lookupKey;
+                    if (isEquity) {
+                        // Logic: Compare suffixes to determine DiffIssuer (Y/N)
+                        String diffIssuer = suffix1.equals(suffixes[j]) ? "Y" : "N";
+                        // Key: ...|Prefix1|Prefix2|DiffIssuer
+                        lookupKey = regime + "|" + rClass + "|" + family + "|" + bucket + "|" + 
+                                    prefix1 + "|" + prefixes[j] + "|" + diffIssuer;
+                    } else {
+                        // Logic: Direct name match, DiffIssuer is NULL
+                        lookupKey = regime + "|" + rClass + "|" + family + "|" + bucket + "|" + 
+                                    name1 + "|" + names[j] + "|NULL";
+                    }
+
+                    // B. Lookup Correlation Data
+                    double[] corrs = lookupData.get(lookupKey);
+                    
+                    // C. Calculate Term Off Diagonal
+                    if (corrs != null) {
+                        double termBase = globalPsi * wK * weights[j];
+                        
+                        // Accumulate immediately
+                        if (corrs[0] != 0) sumMed.add(termBase * corrs[0]);
+                        if (corrs[1] != 0) sumLow.add(termBase * corrs[1]);
+                        if (corrs[2] != 0) sumHigh.add(termBase * corrs[2]);
+                    }
+                }
+            });
+
+            // ---------------------------------------------------------------------
+            // Step 4: Final Aggregation
+            // ---------------------------------------------------------------------
+            // Create the result row. Note: This aggregates the entire bucket into one row 
+            // (assuming Sum aggregation is the goal). If row-level results are needed,
+            // this part would change to return a List<Row>.
+            
+            // Calculate Max Weighted Sensitivity for the bucket (if required by logic)
+            double maxWeight = 0.0;
+            for(double w : weights) { if(Math.abs(w) > Math.abs(maxWeight)) maxWeight = w; }
+
+            return RowFactory.create(
+                first.get(iAggLvl),
+                first.get(iAggVal),
+                regime,
+                first.get(iRepId),
+                bucket,
+                rClass,
+                family,
+                // Taking the first name as representative for the bucket, 
+                // or this field might need to be dropped if aggregating the whole bucket.
+                first.getString(iName), 
+                sumMed.sum(),
+                sumLow.sum(),
+                sumHigh.sum(),
+                maxWeight,
+                first.get(iExcBkt)
+            );
+        }).filter(Objects::nonNull); // Filter out empty buckets
+
+        // Define Output Schema
+        StructType outSchema = DataTypes.createStructType(new StructField[]{
+            DataTypes.createStructField("AGGREGATION_LEVEL", DataTypes.StringType, true),
+            DataTypes.createStructField("AGGREGATION_LEVEL_VALUE", DataTypes.StringType, true),
+            DataTypes.createStructField("REGIME", DataTypes.StringType, true),
+            DataTypes.createStructField("REPORTING_ENTITY_COPER_ID", DataTypes.IntegerType, true),
+            DataTypes.createStructField("RISK_BUCKET", DataTypes.StringType, true),
+            DataTypes.createStructField("RISK_CLASS", DataTypes.StringType, true),
+            DataTypes.createStructField("RISK_FACTOR_SCENARIO_FAMILY", DataTypes.StringType, true),
+            DataTypes.createStructField("RISK_FACTOR_NAME", DataTypes.StringType, true),
+            DataTypes.createStructField("TERM_OFF_DIAGONAL_MEDIUM", DataTypes.DoubleType, false),
+            DataTypes.createStructField("TERM_OFF_DIAGONAL_LOW", DataTypes.DoubleType, false),
+            DataTypes.createStructField("TERM_OFF_DIAGONAL_HIGH", DataTypes.DoubleType, false),
+            DataTypes.createStructField("WEIGHTED_SENSITIVITY_K", DataTypes.DoubleType, false),
+            DataTypes.createStructField("EXCLUDED_RISK_BUCKET", DataTypes.StringType, true)
+        });
+
+        return spark.createDataFrame(resultRdd, outSchema);
+    }
 }
