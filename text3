@@ -1,51 +1,98 @@
-String diffIssuer = "Y"; // 默认不同
+// =====================================================================
+        // 4. Matrix Calculation (Parallel Stream)
+        // =====================================================================
+        List<Row> finalResults = Collections.synchronizedList(new ArrayList<>());
+
+        bucketGroups.entrySet().parallelStream().forEach(entry -> {
+            List<Row> rows = entry.getValue();
+            int n = rows.size();
+            if (n == 0) return;
+
+            // Context from first row
+            Row first = rows.get(0);
+            String riskClass = first.isNullAt(idxRiskClass) ? "" : first.get(idxRiskClass).toString().trim();
+            
+            // [LOGIC FIX]: Identify if this bucket is Equity/CSR
+            boolean isEquity = "EQUITY".equalsIgnoreCase(riskClass) || "CSR_NON_SEC".equalsIgnoreCase(riskClass);
+
+            // Pre-process Arrays
+            String[] names = new String[n];
+            String[] issuers = new String[n]; // Store extracted issuers
+            double[] weights = new double[n];
+
+            for (int i = 0; i < n; i++) {
+                Row r = rows.get(i);
+                weights[i] = r.isNullAt(idxSens) ? 0.0 : ((Number)r.get(idxSens)).doubleValue();
+                String rawName = r.isNullAt(idxName) ? "" : r.get(idxName).toString().trim();
+                names[i] = rawName;
+
+                if (isEquity) {
+                    // [LOGIC FIX]: Extract Issuer logic: String after the last underscore
+                    int lastUnderscore = rawName.lastIndexOf('_');
+                    if (lastUnderscore >= 0 && lastUnderscore < rawName.length() - 1) {
+                        issuers[i] = rawName.substring(lastUnderscore + 1).trim();
+                    } else {
+                        issuers[i] = rawName; // Fallback if no underscore
+                    }
+                }
+            }
+
+            // Common lookup prefix
+            String commonPrefix = (first.isNullAt(idxRegime) ? "" : first.get(idxRegime).toString().trim()) + "|" +
+                                  riskClass + "|" +
+                                  (first.isNullAt(idxFamily) ? "" : first.get(idxFamily).toString().trim()) + "|" +
+                                  (first.isNullAt(idxBucket) ? "" : first.get(idxBucket).toString().trim()) + "|";
+
+            // N x N Matrix Loop
+            IntStream.range(0, n).forEach(i -> {
+                double sumMed = 0.0;
+                double sumLow = 0.0;
+                double sumHigh = 0.0;
+
+                for (int j = 0; j < n; j++) {
+                    String lookupKey;
+
+                    if (isEquity) {
+                        // [LOGIC FIX]: Equity Logic
+                        // 1. Calculate DIFF_ISSUER (Y if different, N if same)
+                        String diffIssuer = "Y";
                         if (issuers[i] != null && issuers[j] != null && issuers[i].equals(issuers[j])) {
-                            diffIssuer = "N"; // 相同
+                            diffIssuer = "N";
                         }
-                        
-                        // 2. 构造 Key，匹配 Driver 端生成的 "Y|Y" 或 "N|N" 这种格式
-                        // 注意：这里假设相关性表中 Name_1 和 Name_2 的前缀逻辑是一致的
+                        // 2. Lookup Key uses "Y|Y" or "N|N" based on the SQL screenshot logic
+                        // (Assuming Name_1 and Name_2 in correlation table both match the Diff Issuer flag)
                         lookupKey = commonPrefix + diffIssuer + "|" + diffIssuer;
+                    } else {
+                        // [LOGIC FIX]: Non-Equity Logic -> Exact Name Match
+                        lookupKey = commonPrefix + names[i] + "|" + names[j];
+                    }
 
+                    double[] corrs = correlationMap.get(lookupKey);
+                    if (corrs != null) {
+                        double term = weights[i] * weights[j];
+                        sumMed += term * corrs[0];
+                        sumLow += term * corrs[1];
+                        sumHigh += term * corrs[2];
+                    }
+                }
 
-
-for (Row r : corrRows) {
-        String rClass = r.isNullAt(1) ? "" : r.get(1).toString().trim();
-        String name1 = r.isNullAt(4) ? "" : r.get(4).toString().trim();
-        String name2 = r.isNullAt(5) ? "" : r.get(5).toString().trim();
-
-        // [关键修正]：如果是 Equity/CSR，SQL 逻辑是匹配 Name 的第一个字符 (Y/N)
-        boolean isEquityRule = "EQUITY".equalsIgnoreCase(rClass) || "CSR_NON_SEC".equalsIgnoreCase(rClass);
-        
-        String keyPart1 = name1;
-        String keyPart2 = name2;
-
-        if (isEquityRule) {
-            // 对应 SQL: TRIM(SUBSTR(CORRELATION.RISK_FACTOR_NAME_1, 1, 1))
-            // 我们在 Map Key 中只存 "Y" 或 "N"，方便 O(1) 查找
-            if (name1.length() > 0) keyPart1 = name1.substring(0, 1);
-            // 注意：SQL 截图显示 Name_1 和 Name_2 都要匹配 Diff Issuer，
-            // 通常 Equity 相关性表里这两个值是一样的 (e.g., Y vs Y)，这里我们统一处理
-            if (name2.length() > 0) keyPart2 = name2.substring(0, 1);
-        }
-
-        // 生成 Map Key
-        String key = (r.isNullAt(0) ? "" : r.get(0).toString().trim()) + "|" + // REGIME
-                     rClass + "|" +                                            // RISK_CLASS
-                     (r.isNullAt(2) ? "" : r.get(2).toString().trim()) + "|" + // FAMILY
-                     (r.isNullAt(3) ? "" : r.get(3).toString().trim()) + "|" + // BUCKET
-                     keyPart1 + "|" +                                          // Name1 (or Y/N)
-                     keyPart2;                                                 // Name2 (or Y/N)
-
-        correlationMap.put(key, new double[]{
-            r.isNullAt(6) ? 0.0 : ((Number)r.get(6)).doubleValue(),
-            r.isNullAt(7) ? 0.0 : ((Number)r.get(7)).doubleValue(),
-            r.isNullAt(8) ? 0.0 : ((Number)r.get(8)).doubleValue()
+                // Add to result
+                finalResults.add(RowFactory.create(
+                    first.get(idxAggLvl),
+                    first.get(idxAggVal),
+                    first.get(idxRegime),
+                    first.get(idxEntity),
+                    first.isNullAt(idxBucket) ? "" : first.get(idxBucket).toString().trim(),
+                    first.get(idxRiskClass),
+                    first.get(idxFamily),
+                    names[i],
+                    sumMed,
+                    sumLow,
+                    sumHigh,
+                    weights[i] // WEIGHTED_SENSITIVITY_K
+                ));
+            });
         });
-
-
-
-
 
 
 
