@@ -1,3 +1,45 @@
+for (Row r : corrRows) {
+        String rClass = r.isNullAt(1) ? "" : r.get(1).toString().trim();
+        String name1 = r.isNullAt(4) ? "" : r.get(4).toString().trim();
+        String name2 = r.isNullAt(5) ? "" : r.get(5).toString().trim();
+
+        // [关键修正]：如果是 Equity/CSR，SQL 逻辑是匹配 Name 的第一个字符 (Y/N)
+        boolean isEquityRule = "EQUITY".equalsIgnoreCase(rClass) || "CSR_NON_SEC".equalsIgnoreCase(rClass);
+        
+        String keyPart1 = name1;
+        String keyPart2 = name2;
+
+        if (isEquityRule) {
+            // 对应 SQL: TRIM(SUBSTR(CORRELATION.RISK_FACTOR_NAME_1, 1, 1))
+            // 我们在 Map Key 中只存 "Y" 或 "N"，方便 O(1) 查找
+            if (name1.length() > 0) keyPart1 = name1.substring(0, 1);
+            // 注意：SQL 截图显示 Name_1 和 Name_2 都要匹配 Diff Issuer，
+            // 通常 Equity 相关性表里这两个值是一样的 (e.g., Y vs Y)，这里我们统一处理
+            if (name2.length() > 0) keyPart2 = name2.substring(0, 1);
+        }
+
+        // 生成 Map Key
+        String key = (r.isNullAt(0) ? "" : r.get(0).toString().trim()) + "|" + // REGIME
+                     rClass + "|" +                                            // RISK_CLASS
+                     (r.isNullAt(2) ? "" : r.get(2).toString().trim()) + "|" + // FAMILY
+                     (r.isNullAt(3) ? "" : r.get(3).toString().trim()) + "|" + // BUCKET
+                     keyPart1 + "|" +                                          // Name1 (or Y/N)
+                     keyPart2;                                                 // Name2 (or Y/N)
+
+        correlationMap.put(key, new double[]{
+            r.isNullAt(6) ? 0.0 : ((Number)r.get(6)).doubleValue(),
+            r.isNullAt(7) ? 0.0 : ((Number)r.get(7)).doubleValue(),
+            r.isNullAt(8) ? 0.0 : ((Number)r.get(8)).doubleValue()
+        });
+
+
+
+
+
+
+
+
+
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.RowFactory;
