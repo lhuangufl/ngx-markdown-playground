@@ -1,72 +1,248 @@
+// ==========================================
+// 1. Spark SQL Core (Dataset, Row, SparkSession)
+// ==========================================
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
+import org.apache.spark.sql.RowFactory;
 import org.apache.spark.sql.SparkSession;
-import org.apache.spark.sql.functions; 
-import scala.collection.JavaConverters; 
+import org.apache.spark.sql.Encoders;
+import org.apache.spark.sql.catalyst.encoders.RowEncoder; // Critical for dynamic schemas
 
-import java.util.Arrays;
+// ==========================================
+// 2. Spark Types (StructType, DataTypes)
+// ==========================================
+import org.apache.spark.sql.types.DataTypes;
+import org.apache.spark.sql.types.StructField;
+import org.apache.spark.sql.types.StructType;
+
+// ==========================================
+// 3. Spark Functions & Broadcasting
+// ==========================================
+import org.apache.spark.api.java.function.MapFunction;
+import org.apache.spark.api.java.function.MapGroupsFunction;
+import org.apache.spark.broadcast.Broadcast;
+
+// ==========================================
+// 4. Java Utilities (Lists, Maps, Iterator)
+// ==========================================
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 
-public class SbmFactorPairingProcessor {
+// ==========================================
+// 5. Java Streams (Parallel execution)
+// ==========================================
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
-    public Dataset<Row> process(SparkSession spark, Map<String, Dataset<Row>> dsMap) {
-        Dataset<Row> inputDs = dsMap.get("SBM_DELTA_VEGA_SENSITIVITIES");
-        if (inputDs == null) throw new RuntimeException("Input missing: SBM_DELTA_VEGA_SENSITIVITIES");
+public Dataset<Row> process(SparkSession spark, Map<String, Dataset<Row>> dsMap) {
 
-        // 1. Projection & Deduplication
-        // Explicitly select columns to minimize memory usage and ensure index stability.
-        String[] colsOfInterest = {
-            "REGIME", "RISK_CLASS", "RISK_BUCKET", "RISK_FACTOR_SCENARIO_FAMILY",
-            "RISK_FACTOR_TENOR", "RISK_FACTOR_TYPE", "ISSUER_ID"
-        };
+    // =========================================================================
+    // 0. Global Setup & Broadcast
+    // =========================================================================
+    Dataset<Row> inputDs = dsMap.get("SBM_DELTA_VEGA_SENSITIVITIES");
+    Dataset<Row> correlationDs = dsMap.get("DELTA_VEGA_INTRA_BUCKET_RESULT_CORRELATION");
+
+    // Helper class for safe casting and string manipulation
+    class Tool {
+        String s(Object o) { return (o == null) ? "" : o.toString().trim(); }
+        double d(Object o) { return (o instanceof Number) ? ((Number) o).doubleValue() : 0.0; }
         
-        // Apply .na().fill("") to mimic the original 'sStr()' logic. 
-        // This ensures nulls are treated as empty strings for safe joining.
-        Dataset<Row> distinctFactorsDs = inputDs.selectExpr(colsOfInterest)
-            .na().fill("") 
-            .distinct();
-
-        // 2. Self-Join Preparation
-        // Alias the DataFrame to treat it as two separate logical tables (Left and Right).
-        Dataset<Row> left = distinctFactorsDs.alias("L");
-        Dataset<Row> right = distinctFactorsDs.alias("R");
-
-        // 3. Define Join Conditions
-        // These columns correspond to the keys used in the original 'getJoinKey' method.
-        List<String> joinKeys = Arrays.asList(
-            "REGIME", "RISK_CLASS", "RISK_BUCKET", "RISK_FACTOR_SCENARIO_FAMILY"
-        );
-        
-        // Convert Java List to Scala Seq required by the Spark API.
-        scala.collection.Seq<String> joinCols = JavaConverters.asScalaBufferConverter(joinKeys).asScala().toSeq();
-
-        // 4. Execute Distributed Join
-        // This leverages the cluster's power (HashJoin/Shuffle) instead of looping on the Driver.
-        Dataset<Row> joinedDs = left.join(right, joinCols, "inner");
-
-        // 5. Column Selection & Renaming
-        // Reconstruct the output schema to match the original requirements.
-        Dataset<Row> result = joinedDs.select(
-            // Shared Keys (Selecting from Left side)
-            functions.col("L.REGIME"),
-            functions.col("L.RISK_CLASS"),
-            functions.col("L.RISK_BUCKET"),
-            functions.col("L.RISK_FACTOR_SCENARIO_FAMILY"),
-            
-            // Left Side Attributes (T.*)
-            functions.col("L.RISK_FACTOR_TENOR"),
-            functions.col("L.RISK_FACTOR_TYPE"),
-            functions.col("L.ISSUER_ID"),
-            
-            // Right Side Attributes (T1.* -> _1 suffix)
-            // Note: RISK_BUCKET is strictly redundant based on the join key, but included to match schema.
-            functions.col("R.RISK_BUCKET").as("RISK_BUCKET_1"), 
-            functions.col("R.RISK_FACTOR_TENOR").as("RISK_FACTOR_TENOR_1"),
-            functions.col("R.RISK_FACTOR_TYPE").as("RISK_FACTOR_TYPE_1"),
-            functions.col("R.ISSUER_ID").as("ISSUER_ID_1")
-        );
-
-        return result;
+        // Replicates SQL logic: SUBSTR(NAME, INSTR(NAME, '_', -1) + 1)
+        String extractIssuer(String name) {
+            if (name == null || !name.contains("_")) return name == null ? "" : name;
+            return name.substring(name.lastIndexOf("_") + 1);
+        }
     }
+    final Tool tool = new Tool();
+
+    // Prepare Correlation Map on Driver
+    Map<String, List<Row>> localCorrMap = new HashMap<>();
+    for (Row r : correlationDs.collectAsList()) {
+        // Compound Key: Regime | Class | Family | Bucket
+        String key = tool.s(r.getAs("REGIME")) + "|" + tool.s(r.getAs("RISK_CLASS")) + "|" + 
+                     tool.s(r.getAs("RISK_FACTOR_SCENARIO_FAMILY")) + "|" + tool.s(r.getAs("RISK_BUCKET"));
+        localCorrMap.computeIfAbsent(key, k -> new ArrayList<>()).add(r);
+    }
+    
+    // Broadcast the map to all Executors to enable Map-Side Join behavior
+    final Broadcast<Map<String, List<Row>>> corrBroadcast = 
+        spark.sparkContext().broadcast(localCorrMap, scala.reflect.ClassTag$.MODULE$.apply(Map.class));
+
+    // Define Output Schema
+    StructType outputSchema = DataTypes.createStructType(new StructField[]{
+        DataTypes.createStructField("AGGREGATION_LEVEL", DataTypes.StringType, true),
+        DataTypes.createStructField("AGGREGATION_LEVEL_VALUE", DataTypes.StringType, true),
+        DataTypes.createStructField("REGIME", DataTypes.StringType, true),
+        DataTypes.createStructField("REPORTING_ENTITY_COPER_ID", DataTypes.StringType, true),
+        DataTypes.createStructField("RISK_BUCKET", DataTypes.StringType, true),
+        DataTypes.createStructField("RISK_CLASS", DataTypes.StringType, true),
+        DataTypes.createStructField("RISK_FACTOR_SCENARIO_FAMILY", DataTypes.StringType, true),
+        DataTypes.createStructField("RISK_FACTOR_NAME_1", DataTypes.StringType, true),
+        DataTypes.createStructField("EXCLUDED_RISK_BUCKET", DataTypes.StringType, true),
+        DataTypes.createStructField("SUM_TERM_OFF_DIAGONAL_MEDIUM", DataTypes.DoubleType, false),
+        DataTypes.createStructField("SUM_TERM_OFF_DIAGONAL_LOW", DataTypes.DoubleType, false),
+        DataTypes.createStructField("SUM_TERM_OFF_DIAGONAL_HIGH", DataTypes.DoubleType, false),
+        DataTypes.createStructField("MAX_WEIGHTED_SENSITIVITY_K", DataTypes.DoubleType, false)
+    });
+
+    // =========================================================================
+    // MAIN EXECUTION PIPELINE
+    // =========================================================================
+    return inputDs
+        .groupByKey((MapFunction<Row, String>) r -> 
+            tool.s(r.getAs("REPORTING_ENTITY_COPER_ID")) + "|" + 
+            tool.s(r.getAs("REGIME")) + "|" + 
+            tool.s(r.getAs("RISK_BUCKET")), 
+            Encoders.STRING())
+        .flatMapGroups((MapGroupsFunction<String, Row, Row>) (groupKey, iterator) -> {
+
+            // Lightweight POJO to avoid repetitive Row.getAs calls inside loops
+            class FactorNode {
+                final String name, issuer, excludedBucket;
+                final double sens;
+                FactorNode(Row r) {
+                    this.name = tool.s(r.getAs("RISK_FACTOR_NAME"));
+                    this.issuer = tool.extractIssuer(this.name);
+                    this.excludedBucket = tool.s(r.getAs("EXCLUDED_RISK_BUCKET"));
+                    this.sens = tool.d(r.getAs("WEIGHTED_SENSITIVITY"));
+                }
+            }
+
+            // =============================================================
+            // Step 1: Input Materialization (Transform Stream to List)
+            // =============================================================
+            class Step1_InputMaterializer {
+                List<FactorNode> materialize(Iterator<Row> it, List<Row> metaHolder) {
+                    List<FactorNode> list = new ArrayList<>();
+                    while (it.hasNext()) {
+                        Row r = it.next();
+                        if (metaHolder.isEmpty()) metaHolder.add(r); // Capture metadata from first row
+                        list.add(new FactorNode(r));
+                    }
+                    return list;
+                }
+            }
+
+            // =============================================================
+            // Step 2: Key Enrichment (Derive Logic Flags like DIFF_ISSUER)
+            // =============================================================
+            class Step2_KeyEnricher {
+                final boolean isEquityOrCsr;
+                
+                Step2_KeyEnricher(String rClass) {
+                    this.isEquityOrCsr = "EQUITY".equalsIgnoreCase(rClass) || "CSR_NON_SEC".equalsIgnoreCase(rClass);
+                }
+                
+                // Calculates the 'DIFF_ISSUER' flag required for Equity logic
+                String getDiffIssuerFlag(FactorNode n1, FactorNode n2) {
+                    if (!isEquityOrCsr) return "N"; 
+                    return (!n1.issuer.equals(n2.issuer)) ? "Y" : "N";
+                }
+            }
+
+            // =============================================================
+            // Step 3: Correlation Lookup (The "Join" Logic)
+            // =============================================================
+            class Step3_CorrelationLookup {
+                final List<Row> rules;
+                final boolean isEquity;
+
+                Step3_CorrelationLookup(Row meta) {
+                    String key = tool.s(meta.getAs("REGIME")) + "|" + tool.s(meta.getAs("RISK_CLASS")) + "|" + 
+                                 tool.s(meta.getAs("RISK_FACTOR_SCENARIO_FAMILY")) + "|" + tool.s(meta.getAs("RISK_BUCKET"));
+                    this.rules = corrBroadcast.value().getOrDefault(key, Collections.emptyList());
+                    this.isEquity = "EQUITY".equalsIgnoreCase(tool.s(meta.getAs("RISK_CLASS"))) || 
+                                    "CSR_NON_SEC".equalsIgnoreCase(tool.s(meta.getAs("RISK_CLASS")));
+                }
+                
+                // Mimics the SQL LEFT JOIN ON conditions
+                Row findMatch(String n1, String n2, String diffIssuer) {
+                    for (Row rule : rules) {
+                        if (!isEquity) {
+                            // Standard Logic: Exact match on names
+                            if (tool.s(rule.getAs("RISK_FACTOR_NAME_1")).equals(n1) && 
+                                tool.s(rule.getAs("RISK_FACTOR_NAME_2")).equals(n2)) return rule;
+                        } else {
+                            // Equity Logic: Fuzzy match based on DIFF_ISSUER prefix
+                            String marker = tool.s(rule.getAs("RISK_FACTOR_NAME_1")).trim();
+                            if (!marker.isEmpty() && marker.startsWith(diffIssuer)) return rule;
+                        }
+                    }
+                    return null; // No match found (correlation is effectively 0)
+                }
+            }
+
+            // =============================================================
+            // Step 4: Aggregation & Result Building
+            // =============================================================
+            class Step4_ResultBuilder {
+                Row build(Row meta, FactorNode node, double m, double l, double h) {
+                    return RowFactory.create(
+                        tool.s(meta.getAs("AGGREGATION_LEVEL")),
+                        tool.s(meta.getAs("AGGREGATION_LEVEL_VALUE")),
+                        tool.s(meta.getAs("REGIME")),
+                        tool.s(meta.getAs("REPORTING_ENTITY_COPER_ID")),
+                        tool.s(meta.getAs("RISK_BUCKET")),
+                        tool.s(meta.getAs("RISK_CLASS")),
+                        tool.s(meta.getAs("RISK_FACTOR_SCENARIO_FAMILY")),
+                        node.name,
+                        node.excludedBucket,
+                        m, l, h,
+                        node.sens 
+                    );
+                }
+            }
+
+            // =============================================================
+            // Execution Flow
+            // =============================================================
+            
+            // 1. Materialize Data
+            List<Row> metaHolder = new ArrayList<>();
+            Step1_InputMaterializer step1 = new Step1_InputMaterializer();
+            List<FactorNode> nodes = step1.materialize(iterator, metaHolder);
+            
+            if (nodes.isEmpty()) return Collections.emptyIterator();
+            Row metaRow = metaHolder.get(0); 
+
+            // 2. Initialize Steps with Context
+            Step2_KeyEnricher step2 = new Step2_KeyEnricher(tool.s(metaRow.getAs("RISK_CLASS")));
+            Step3_CorrelationLookup step3 = new Step3_CorrelationLookup(metaRow);
+            Step4_ResultBuilder step4 = new Step4_ResultBuilder();
+
+            // 3. Parallel Matrix Calculation
+            // Using parallel stream to utilize all CPU cores for the N*N nested loop
+            return IntStream.range(0, nodes.size()).parallel().mapToObj(i -> {
+                FactorNode t1 = nodes.get(i);
+                
+                // Using primitive double is faster than DoubleAdder here because 
+                // these variables are thread-confined (local to this lambda execution).
+                double sumMed = 0.0, sumLow = 0.0, sumHigh = 0.0;
+
+                for (FactorNode t2 : nodes) {
+                    // Enrich
+                    String diffIssuer = step2.getDiffIssuerFlag(t1, t2);
+                    
+                    // Lookup
+                    Row rule = step3.findMatch(t1.name, t2.name, diffIssuer);
+
+                    // Aggregate
+                    if (rule != null) {
+                        double term = t1.sens * t2.sens; 
+                        sumMed += tool.d(rule.getAs("CORRELATION_MEDIUM")) * term;
+                        sumLow += tool.d(rule.getAs("CORRELATION_LOW")) * term;
+                        sumHigh += tool.d(rule.getAs("CORRELATION_HIGH")) * term;
+                    }
+                }
+
+                // Build Final Row
+                return step4.build(metaRow, t1, sumMed, sumLow, sumHigh);
+
+            }).collect(Collectors.toList()).iterator();
+
+        }, RowEncoder.apply(outputSchema));
 }
