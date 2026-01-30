@@ -1,3 +1,14 @@
+这是一个非常细致的观察。你是完全正确的。
+
+**原因分析**：
+在当前的写法中，我们使用了**匿名内部类 (Anonymous Inner Class)** 来实现 Spark 的接口（如 `PairFunction`, `FlatMapFunction`）。
+
+* Spark 的这些接口（`org.apache.spark.api.java.function.*`）本身就已经继承了 `Serializable`。
+* 既然我们不再定义自定义的 POJO 类（如之前尝试过的 `Trade` 或 `RiskFactor`），也不再显式地让某个类 `implements Serializable`，那么 **`import java.io.Serializable;` 确实是多余的废代码**。
+
+以下是**最终极简、无废引用、无辅助方法、内联逻辑**的完整代码。
+
+```java
 import org.apache.spark.api.java.JavaPairRDD;
 import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.api.java.function.FlatMapFunction;
@@ -172,4 +183,47 @@ public class SbmStructuredProcessor {
                             }
                         }
 
-                        results.
+                        results.add(RowFactory.create(
+                            first.get(indexAggregationLevel), 
+                            first.get(indexAggregationLevelValue), 
+                            first.get(indexRegime), 
+                            first.get(indexReportingEntityId), 
+                            first.isNullAt(indexRiskBucket) ? "" : first.get(indexRiskBucket).toString().trim(),   
+                            first.get(indexRiskClass), 
+                            first.get(indexScenarioFamily), 
+                            names[i], 
+                            sumMed, 
+                            sumLow, 
+                            sumHigh, 
+                            weights[i]
+                        ));
+                    }
+
+                    return results.iterator();
+                }
+            }
+        );
+
+        // =====================================================================
+        // 4. Define Output Schema
+        // =====================================================================
+        StructType outSchema = DataTypes.createStructType(new StructField[]{
+            DataTypes.createStructField("AGGREGATION_LEVEL", DataTypes.StringType, true),
+            DataTypes.createStructField("AGGREGATION_LEVEL_VALUE", DataTypes.StringType, true),
+            DataTypes.createStructField("REGIME", DataTypes.StringType, true),
+            DataTypes.createStructField("REPORTING_ENTITY_COPER_ID", DataTypes.IntegerType, true), 
+            DataTypes.createStructField("RISK_BUCKET", DataTypes.StringType, true),
+            DataTypes.createStructField("RISK_CLASS", DataTypes.StringType, true),
+            DataTypes.createStructField("RISK_FACTOR_SCENARIO_FAMILY", DataTypes.StringType, true),
+            DataTypes.createStructField("RISK_FACTOR_NAME", DataTypes.StringType, true),
+            DataTypes.createStructField("TERM_OFF_DIAGONAL_MEDIUM", DataTypes.DoubleType, false),
+            DataTypes.createStructField("TERM_OFF_DIAGONAL_LOW", DataTypes.DoubleType, false),
+            DataTypes.createStructField("TERM_OFF_DIAGONAL_HIGH", DataTypes.DoubleType, false),
+            DataTypes.createStructField("WEIGHTED_SENSITIVITY_K", DataTypes.DoubleType, false)
+        });
+
+        return sparkSession.createDataFrame(resultRdd, outSchema);
+    }
+}
+
+```
