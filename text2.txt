@@ -1,5 +1,5 @@
-import org.apache.spark.api.java.JavaSparkContext; // 必须引入
-import org.apache.spark.api.java.function.FlatMapGroupsFunction; // 修正为 FlatMap
+import org.apache.spark.api.java.JavaSparkContext;
+import org.apache.spark.api.java.function.FlatMapGroupsFunction;
 import org.apache.spark.api.java.function.MapFunction;
 import org.apache.spark.broadcast.Broadcast;
 import org.apache.spark.sql.*;
@@ -7,14 +7,16 @@ import org.apache.spark.sql.catalyst.encoders.RowEncoder;
 import org.apache.spark.sql.types.*;
 import java.util.*;
 import java.util.stream.*;
+import java.io.Serializable; // 显式引入
 
 /**
  * Main execution method containing all business logic.
+ * Serializable-safe version: Removes captured local classes.
  */
 public Dataset<Row> process(SparkSession spark, Map<String, Dataset<Row>> dsMap) {
 
     // =========================================================================
-    // 0. Global Setup & Broadcast
+    // 1. Retrieve Inputs
     // =========================================================================
     Dataset<Row> inputDs = dsMap.get("SBM_DELTA_VEGA_SENSITIVITIES");
     Dataset<Row> correlationDs = dsMap.get("DELTA_VEGA_INTRA_BUCKET_RESULT_CORRELATION");
@@ -23,32 +25,31 @@ public Dataset<Row> process(SparkSession spark, Map<String, Dataset<Row>> dsMap)
         throw new RuntimeException("Missing required inputs.");
     }
 
-    // Tool: Local helper for null-safe operations
-    class Tool {
-        String s(Object o) { return (o == null) ? "" : o.toString().trim(); }
-        double d(Object o) { return (o instanceof Number) ? ((Number) o).doubleValue() : 0.0; }
-        String extractIssuer(String name) {
-            if (name == null || !name.contains("_")) return name == null ? "" : name;
-            return name.substring(name.lastIndexOf("_") + 1);
-        }
-    }
-    final Tool tool = new Tool();
-
-    // 1. Prepare Correlation Map (Driver Side)
+    // =========================================================================
+    // 2. Prepare Correlation Map (Driver Side Logic Only)
+    // =========================================================================
+    // 这里我们使用内联逻辑，避免定义需要序列化的类
     Map<String, List<Row>> localCorrMap = new HashMap<>();
     List<Row> corrList = correlationDs.collectAsList();
+    
     for (Row r : corrList) {
-        String key = tool.s(r.getAs("REGIME")) + "|" + tool.s(r.getAs("RISK_CLASS")) + "|" + 
-                     tool.s(r.getAs("RISK_FACTOR_SCENARIO_FAMILY")) + "|" + tool.s(r.getAs("RISK_BUCKET"));
+        // Driver-side safe null handling
+        String reg = (r.getAs("REGIME") == null) ? "" : r.getAs("REGIME").toString().trim();
+        String cls = (r.getAs("RISK_CLASS") == null) ? "" : r.getAs("RISK_CLASS").toString().trim();
+        String fam = (r.getAs("RISK_FACTOR_SCENARIO_FAMILY") == null) ? "" : r.getAs("RISK_FACTOR_SCENARIO_FAMILY").toString().trim();
+        String bkt = (r.getAs("RISK_BUCKET") == null) ? "" : r.getAs("RISK_BUCKET").toString().trim();
+        
+        String key = reg + "|" + cls + "|" + fam + "|" + bkt;
         localCorrMap.computeIfAbsent(key, k -> new ArrayList<>()).add(r);
     }
     
-    // 2. Broadcast using JavaSparkContext (Fixes the "cannot find symbol" error)
-    // We wrap the raw context to use the Java-friendly broadcast method
+    // Broadcast the map
     JavaSparkContext jsc = new JavaSparkContext(spark.sparkContext());
     final Broadcast<Map<String, List<Row>>> corrBroadcast = jsc.broadcast(localCorrMap);
 
+    // =========================================================================
     // 3. Define Output Schema
+    // =========================================================================
     StructType outputSchema = DataTypes.createStructType(new StructField[]{
         DataTypes.createStructField("AGGREGATION_LEVEL", DataTypes.StringType, true),
         DataTypes.createStructField("AGGREGATION_LEVEL_VALUE", DataTypes.StringType, true),
@@ -66,19 +67,37 @@ public Dataset<Row> process(SparkSession spark, Map<String, Dataset<Row>> dsMap)
     });
 
     // =========================================================================
-    // MAIN EXECUTION PIPELINE
+    // 4. Execution Pipeline (Safe from Serialization Errors)
     // =========================================================================
     return inputDs
-        .groupByKey((MapFunction<Row, String>) r -> 
-            tool.s(r.getAs("REPORTING_ENTITY_COPER_ID")) + "|" + 
-            tool.s(r.getAs("REGIME")) + "|" + 
-            tool.s(r.getAs("RISK_BUCKET")), 
-            Encoders.STRING())
-        // FIX: Use FlatMapGroupsFunction explicitly with an Anonymous Inner Class
+        .groupByKey(new MapFunction<Row, String>() {
+            @Override
+            public String call(Row r) throws Exception {
+                // INLINE LOGIC: Do not use external helper objects here.
+                // This runs on Executors and must be self-contained.
+                String id = (r.getAs("REPORTING_ENTITY_COPER_ID") == null) ? "" : r.getAs("REPORTING_ENTITY_COPER_ID").toString().trim();
+                String reg = (r.getAs("REGIME") == null) ? "" : r.getAs("REGIME").toString().trim();
+                String bkt = (r.getAs("RISK_BUCKET") == null) ? "" : r.getAs("RISK_BUCKET").toString().trim();
+                
+                return id + "|" + reg + "|" + bkt;
+            }
+        }, Encoders.STRING())
         .flatMapGroups(new FlatMapGroupsFunction<String, Row, Row>() {
             @Override
             public Iterator<Row> call(String groupKey, Iterator<Row> iterator) throws Exception {
                 
+                // --- EXECUTOR LOCAL CLASS DEFINITION ---
+                // 定义在 call 内部，确保它是在 Executor 端创建的，无需从 Driver 序列化传输。
+                class Tool {
+                    String s(Object o) { return (o == null) ? "" : o.toString().trim(); }
+                    double d(Object o) { return (o instanceof Number) ? ((Number) o).doubleValue() : 0.0; }
+                    String extractIssuer(String name) {
+                        if (name == null || !name.contains("_")) return name == null ? "" : name;
+                        return name.substring(name.lastIndexOf("_") + 1);
+                    }
+                }
+                final Tool tool = new Tool(); // Local instance
+
                 // POJO for performance
                 class FactorNode {
                     final String name, issuer, excludedBucket;
@@ -111,9 +130,10 @@ public Dataset<Row> process(SparkSession spark, Map<String, Dataset<Row>> dsMap)
                                    tool.s(metaRow.getAs("RISK_FACTOR_SCENARIO_FAMILY")) + "|" + 
                                    tool.s(metaRow.getAs("RISK_BUCKET"));
                 
+                // Retrieve rules from Broadcast (Safe, as Broadcast is designed to be serialized)
                 List<Row> rules = corrBroadcast.value().getOrDefault(lookupKey, Collections.emptyList());
 
-                // Step 4: Parallel Calculation (Core Logic)
+                // Step 4: Parallel Calculation
                 return IntStream.range(0, nodes.size()).parallel().mapToObj(i -> {
                     FactorNode t1 = nodes.get(i);
                     double sumMed = 0.0, sumLow = 0.0, sumHigh = 0.0;
