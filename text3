@@ -1,14 +1,3 @@
-这是一个非常细致的观察。你是完全正确的。
-
-**原因分析**：
-在当前的写法中，我们使用了**匿名内部类 (Anonymous Inner Class)** 来实现 Spark 的接口（如 `PairFunction`, `FlatMapFunction`）。
-
-* Spark 的这些接口（`org.apache.spark.api.java.function.*`）本身就已经继承了 `Serializable`。
-* 既然我们不再定义自定义的 POJO 类（如之前尝试过的 `Trade` 或 `RiskFactor`），也不再显式地让某个类 `implements Serializable`，那么 **`import java.io.Serializable;` 确实是多余的废代码**。
-
-以下是**最终极简、无废引用、无辅助方法、内联逻辑**的完整代码。
-
-```java
 import org.apache.spark.api.java.JavaPairRDD;
 import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.api.java.function.FlatMapFunction;
@@ -25,19 +14,21 @@ import scala.Tuple2;
 
 import java.util.*;
 import java.util.stream.IntStream;
-// Removed java.io.Serializable as it is not explicitly needed for anonymous inner classes of Spark interfaces
 
 public class SbmStructuredProcessor {
 
     public Dataset<Row> process(SparkSession sparkSession, Map<String, Dataset<Row>> dsMap) {
-        // [Safety Check] Validate input datasets
+        
+        // =====================================================================
+        // 1. Safety Check & Input Retrieval
+        // =====================================================================
         Dataset<Row> inputDs = dsMap.get("SBM_DELTA_VEGA_SENSITIVITIES");
         Dataset<Row> corrDs = dsMap.get("DELTA_VEGA_INTRA_BUCKET_RESULT_CORRELATION");
 
         if (inputDs == null || corrDs == null) throw new RuntimeException("Missing required datasets");
 
         // =====================================================================
-        // 1. Broadcast Preparation (Driver Side)
+        // 2. Broadcast Preparation (Driver Side)
         // =====================================================================
         List<Row> corrRows = corrDs.select(
             "REGIME", "RISK_CLASS", "RISK_FACTOR_SCENARIO_FAMILY", "RISK_BUCKET",
@@ -47,8 +38,7 @@ public class SbmStructuredProcessor {
 
         Map<String, double[]> correlationMap = new HashMap<>(corrRows.size());
         for (Row r : corrRows) {
-            // Inline logic: Check null, then toString(), then trim.
-            // This handles Integer/String types safely without a helper method.
+            // Inline null-safe logic to avoid helper methods
             String key = (r.isNullAt(0) ? "" : r.get(0).toString().trim()) + "|" +
                          (r.isNullAt(1) ? "" : r.get(1).toString().trim()) + "|" +
                          (r.isNullAt(2) ? "" : r.get(2).toString().trim()) + "|" +
@@ -68,144 +58,181 @@ public class SbmStructuredProcessor {
         );
 
         // =====================================================================
-        // 2. Capture Field Indices (Driver Side)
+        // 3. Configuration Packing (The "Anti-Closure" Strategy)
         // =====================================================================
-        final int indexRegime = inputDs.schema().fieldIndex("REGIME");
-        final int indexRiskClass = inputDs.schema().fieldIndex("RISK_CLASS");
-        final int indexScenarioFamily = inputDs.schema().fieldIndex("RISK_FACTOR_SCENARIO_FAMILY");
-        final int indexRiskBucket = inputDs.schema().fieldIndex("RISK_BUCKET");
-        final int indexRiskFactorName = inputDs.schema().fieldIndex("RISK_FACTOR_NAME");
-        final int indexWeightedSensitivity = inputDs.schema().fieldIndex("WEIGHTED_SENSITIVITY");
-        final int indexAggregationLevel = inputDs.schema().fieldIndex("AGGREGATION_LEVEL");
-        final int indexAggregationLevelValue = inputDs.schema().fieldIndex("AGGREGATION_LEVEL_VALUE");
-        final int indexReportingEntityId = inputDs.schema().fieldIndex("REPORTING_ENTITY_COPER_ID");
-        final int indexExcludedRiskBucket = inputDs.schema().fieldIndex("EXCLUDED_RISK_BUCKET");
+        // We pack all indices into a serializable int[] array.
+        // This array will be passed to inner classes via constructor.
+        // Array Layout:
+        // [0]=Regime, [1]=Class, [2]=Family, [3]=Bucket, [4]=Name, [5]=Sens, 
+        // [6]=AggLvl, [7]=AggVal, [8]=EntityId
+        int[] indexConfig = new int[] {
+            inputDs.schema().fieldIndex("REGIME"),
+            inputDs.schema().fieldIndex("RISK_CLASS"),
+            inputDs.schema().fieldIndex("RISK_FACTOR_SCENARIO_FAMILY"),
+            inputDs.schema().fieldIndex("RISK_BUCKET"),
+            inputDs.schema().fieldIndex("RISK_FACTOR_NAME"),
+            inputDs.schema().fieldIndex("WEIGHTED_SENSITIVITY"),
+            inputDs.schema().fieldIndex("AGGREGATION_LEVEL"),
+            inputDs.schema().fieldIndex("AGGREGATION_LEVEL_VALUE"),
+            inputDs.schema().fieldIndex("REPORTING_ENTITY_COPER_ID"),
+            inputDs.schema().fieldIndex("EXCLUDED_RISK_BUCKET") // Index 9
+        };
 
         // =====================================================================
-        // 3. RDD Processing (Strictly using Anonymous Inner Classes)
+        // 4. Define Logic Classes INSIDE process()
+        // =====================================================================
+
+        /**
+         * Mapper Class for Grouping.
+         * Defined locally to ensure encapsulation, but uses explicit state (idx array)
+         * to avoid capturing the outer class reference.
+         */
+        class GroupingMapper implements PairFunction<Row, String, Row> {
+            private final int[] idx;
+
+            // Explicit Constructor: Receives state manually
+            GroupingMapper(int[] idx) {
+                this.idx = idx;
+            }
+
+            @Override
+            public Tuple2<String, Row> call(Row r) {
+                // Accessing indices via local array 'idx', NOT outer variables
+                String k = (r.isNullAt(idx[8]) ? "" : r.get(idx[8]).toString().trim()) + "|" + // EntityID
+                           (r.isNullAt(idx[6]) ? "" : r.get(idx[6]).toString().trim()) + "|" + // AggLvl
+                           (r.isNullAt(idx[7]) ? "" : r.get(idx[7]).toString().trim()) + "|" + // AggVal
+                           (r.isNullAt(idx[0]) ? "" : r.get(idx[0]).toString().trim()) + "|" + // Regime
+                           (r.isNullAt(idx[1]) ? "" : r.get(idx[1]).toString().trim()) + "|" + // Class
+                           (r.isNullAt(idx[2]) ? "" : r.get(idx[2]).toString().trim()) + "|" + // Family
+                           (r.isNullAt(idx[3]) ? "" : r.get(idx[3]).toString().trim());        // Bucket
+                return new Tuple2<>(k, r);
+            }
+        }
+
+        /**
+         * Calculator Class for Matrix Multiplication.
+         * Defined locally. Receives Broadcast and Indices via constructor.
+         */
+        class MatrixCalculator implements FlatMapFunction<Tuple2<String, Iterable<Row>>, Row> {
+            private final int[] idx;
+            private final Broadcast<Map<String, double[]>> broadcast;
+
+            // Explicit Constructor
+            MatrixCalculator(int[] idx, Broadcast<Map<String, double[]>> broadcast) {
+                this.idx = idx;
+                this.broadcast = broadcast;
+            }
+
+            @Override
+            public Iterator<Row> call(Tuple2<String, Iterable<Row>> tuple) {
+                // Materialize rows
+                List<Row> rows = new ArrayList<>();
+                for (Row r : tuple._2()) {
+                    rows.add(r);
+                }
+                int n = rows.size();
+                if (n == 0) return Collections.emptyIterator();
+
+                // Context info
+                Row first = rows.get(0);
+                String riskClass = first.isNullAt(idx[1]) ? "" : first.get(idx[1]).toString().trim();
+                boolean isEquity = "EQUITY".equalsIgnoreCase(riskClass) || "CSR_NON_SEC".equalsIgnoreCase(riskClass);
+
+                // Pre-process Arrays
+                String[] names = new String[n];
+                String[] prefixes = new String[n];
+                String[] suffixes = new String[n];
+                double[] weights = new double[n];
+
+                for (int i = 0; i < n; i++) {
+                    Row r = rows.get(i);
+                    // Handle Sensitivity (idx[5])
+                    weights[i] = r.isNullAt(idx[5]) ? 0.0 : ((Number)r.get(idx[5])).doubleValue();
+                    
+                    // Handle Name (idx[4])
+                    String rawName = r.isNullAt(idx[4]) ? "" : r.get(idx[4]).toString().trim();
+                    names[i] = rawName;
+
+                    if (isEquity) {
+                        int lastUnderscore = rawName.lastIndexOf('_');
+                        if (lastUnderscore > 0) {
+                            prefixes[i] = rawName.substring(0, lastUnderscore).trim();
+                            suffixes[i] = rawName.substring(lastUnderscore + 1).trim();
+                        } else {
+                            prefixes[i] = rawName;
+                            suffixes[i] = rawName;
+                        }
+                    }
+                }
+
+                Map<String, double[]> lookupData = broadcast.value();
+                
+                // Pre-calculate common key prefix
+                String regime = first.isNullAt(idx[0]) ? "" : first.get(idx[0]).toString().trim();
+                String family = first.isNullAt(idx[2]) ? "" : first.get(idx[2]).toString().trim();
+                String bucket = first.isNullAt(idx[3]) ? "" : first.get(idx[3]).toString().trim();
+                
+                String commonPrefix = regime + "|" + riskClass + "|" + family + "|" + bucket + "|";
+
+                List<Row> results = new ArrayList<>(n);
+
+                // Calculation Loop
+                for (int i = 0; i < n; i++) {
+                    double sumMed = 0.0;
+                    double sumLow = 0.0;
+                    double sumHigh = 0.0;
+
+                    for (int j = 0; j < n; j++) {
+                        String lookupKey;
+                        if (isEquity) {
+                            lookupKey = commonPrefix + prefixes[i] + "|" + prefixes[j];
+                        } else {
+                            lookupKey = commonPrefix + names[i] + "|" + names[j];
+                        }
+
+                        double[] corrs = lookupData.get(lookupKey);
+                        if (corrs != null) {
+                            double term = weights[i] * weights[j];
+                            sumMed += term * corrs[0];
+                            sumLow += term * corrs[1];
+                            sumHigh += term * corrs[2];
+                        }
+                    }
+
+                    results.add(RowFactory.create(
+                        first.get(idx[6]), // AggLevel
+                        first.get(idx[7]), // AggVal
+                        first.get(idx[0]), // Regime
+                        first.get(idx[8]), // EntityID
+                        first.isNullAt(idx[3]) ? "" : first.get(idx[3]).toString().trim(), // Bucket
+                        first.get(idx[1]), // RiskClass
+                        first.get(idx[2]), // Family
+                        names[i], 
+                        sumMed, 
+                        sumLow, 
+                        sumHigh, 
+                        weights[i] // WEIGHTED_SENSITIVITY_K
+                    ));
+                }
+
+                return results.iterator();
+            }
+        }
+
+        // =====================================================================
+        // 5. Execution Pipeline
         // =====================================================================
         
-        // [Step 1] MapToPair & GroupByKey
-        JavaPairRDD<String, Iterable<Row>> bucketedRdd = inputDs.toJavaRDD().mapToPair(
-            new PairFunction<Row, String, Row>() {
-                @Override
-                public Tuple2<String, Row> call(Row r) throws Exception {
-                    // Inline null-safe logic used directly here
-                    String k = (r.isNullAt(indexReportingEntityId) ? "" : r.get(indexReportingEntityId).toString().trim()) + "|" +
-                               (r.isNullAt(indexAggregationLevel) ? "" : r.get(indexAggregationLevel).toString().trim()) + "|" +
-                               (r.isNullAt(indexAggregationLevelValue) ? "" : r.get(indexAggregationLevelValue).toString().trim()) + "|" +
-                               (r.isNullAt(indexRegime) ? "" : r.get(indexRegime).toString().trim()) + "|" +
-                               (r.isNullAt(indexRiskClass) ? "" : r.get(indexRiskClass).toString().trim()) + "|" +
-                               (r.isNullAt(indexScenarioFamily) ? "" : r.get(indexScenarioFamily).toString().trim()) + "|" +
-                               (r.isNullAt(indexRiskBucket) ? "" : r.get(indexRiskBucket).toString().trim());
-                    return new Tuple2<>(k, r);
-                }
-            }
-        ).groupByKey();
+        // Pass the 'indexConfig' array to constructor to avoid closure capture
+        JavaPairRDD<String, Iterable<Row>> bucketedRdd = inputDs.toJavaRDD()
+            .mapToPair(new GroupingMapper(indexConfig))
+            .groupByKey();
 
-        // [Step 2] Matrix Multiplication using FlatMapFunction
-        JavaRDD<Row> resultRdd = bucketedRdd.flatMap(
-            new FlatMapFunction<Tuple2<String, Iterable<Row>>, Row>() {
-                @Override
-                public Iterator<Row> call(Tuple2<String, Iterable<Row>> tuple) throws Exception {
-                    
-                    // Materialize Iterable to List
-                    List<Row> rows = new ArrayList<>();
-                    for (Row r : tuple._2()) {
-                        rows.add(r);
-                    }
-                    
-                    int n = rows.size();
-                    if (n == 0) return Collections.emptyIterator();
-
-                    // Context info from first row (using inline logic)
-                    Row first = rows.get(0);
-                    String riskClass = first.isNullAt(indexRiskClass) ? "" : first.get(indexRiskClass).toString().trim();
-                    boolean isEquity = "EQUITY".equalsIgnoreCase(riskClass) || "CSR_NON_SEC".equalsIgnoreCase(riskClass);
-
-                    // Pre-process Arrays
-                    String[] names = new String[n];
-                    String[] prefixes = new String[n];
-                    String[] suffixes = new String[n];
-                    double[] weights = new double[n];
-
-                    for (int i = 0; i < n; i++) {
-                        Row r = rows.get(i);
-                        weights[i] = r.isNullAt(indexWeightedSensitivity) ? 0.0 : ((Number)r.get(indexWeightedSensitivity)).doubleValue();
-                        
-                        String rawName = r.isNullAt(indexRiskFactorName) ? "" : r.get(indexRiskFactorName).toString().trim();
-                        names[i] = rawName;
-
-                        if (isEquity) {
-                            int lastUnderscore = rawName.lastIndexOf('_');
-                            if (lastUnderscore > 0) {
-                                prefixes[i] = rawName.substring(0, lastUnderscore).trim();
-                                suffixes[i] = rawName.substring(lastUnderscore + 1).trim();
-                            } else {
-                                prefixes[i] = rawName;
-                                suffixes[i] = rawName;
-                            }
-                        }
-                    }
-
-                    Map<String, double[]> lookupData = corrBroadcast.value();
-                    
-                    // Pre-calculate common key prefix
-                    String regime = first.isNullAt(indexRegime) ? "" : first.get(indexRegime).toString().trim();
-                    String family = first.isNullAt(indexScenarioFamily) ? "" : first.get(indexScenarioFamily).toString().trim();
-                    String bucket = first.isNullAt(indexRiskBucket) ? "" : first.get(indexRiskBucket).toString().trim();
-                    
-                    String commonPrefix = regime + "|" + riskClass + "|" + family + "|" + bucket + "|";
-
-                    // Result Container
-                    List<Row> results = new ArrayList<>(n);
-
-                    // Nested Loop (Avoids Lambda inside RDD operations)
-                    for (int i = 0; i < n; i++) {
-                        double sumMed = 0.0;
-                        double sumLow = 0.0;
-                        double sumHigh = 0.0;
-
-                        for (int j = 0; j < n; j++) {
-                            String lookupKey;
-                            if (isEquity) {
-                                lookupKey = commonPrefix + prefixes[i] + "|" + prefixes[j];
-                            } else {
-                                lookupKey = commonPrefix + names[i] + "|" + names[j];
-                            }
-
-                            double[] corrs = lookupData.get(lookupKey);
-                            if (corrs != null) {
-                                double term = weights[i] * weights[j];
-                                sumMed += term * corrs[0];
-                                sumLow += term * corrs[1];
-                                sumHigh += term * corrs[2];
-                            }
-                        }
-
-                        results.add(RowFactory.create(
-                            first.get(indexAggregationLevel), 
-                            first.get(indexAggregationLevelValue), 
-                            first.get(indexRegime), 
-                            first.get(indexReportingEntityId), 
-                            first.isNullAt(indexRiskBucket) ? "" : first.get(indexRiskBucket).toString().trim(),   
-                            first.get(indexRiskClass), 
-                            first.get(indexScenarioFamily), 
-                            names[i], 
-                            sumMed, 
-                            sumLow, 
-                            sumHigh, 
-                            weights[i]
-                        ));
-                    }
-
-                    return results.iterator();
-                }
-            }
-        );
+        // Pass 'indexConfig' and 'corrBroadcast' to constructor
+        JavaRDD<Row> resultRdd = bucketedRdd.flatMap(new MatrixCalculator(indexConfig, corrBroadcast));
 
         // =====================================================================
-        // 4. Define Output Schema
+        // 6. Output Schema
         // =====================================================================
         StructType outSchema = DataTypes.createStructType(new StructField[]{
             DataTypes.createStructField("AGGREGATION_LEVEL", DataTypes.StringType, true),
@@ -223,7 +250,3 @@ public class SbmStructuredProcessor {
         });
 
         return sparkSession.createDataFrame(resultRdd, outSchema);
-    }
-}
-
-```
