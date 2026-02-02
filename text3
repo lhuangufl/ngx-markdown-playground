@@ -1,103 +1,3 @@
-// =====================================================================
-        // 4. Matrix Calculation (Parallel Stream)
-        // =====================================================================
-        List<Row> finalResults = Collections.synchronizedList(new ArrayList<>());
-
-        bucketGroups.entrySet().parallelStream().forEach(entry -> {
-            List<Row> rows = entry.getValue();
-            int n = rows.size();
-            if (n == 0) return;
-
-            // Context from first row
-            Row first = rows.get(0);
-            String riskClass = first.isNullAt(idxRiskClass) ? "" : first.get(idxRiskClass).toString().trim();
-            
-            // [LOGIC FIX]: Identify if this bucket is Equity/CSR
-            boolean isEquity = "EQUITY".equalsIgnoreCase(riskClass) || "CSR_NON_SEC".equalsIgnoreCase(riskClass);
-
-            // Pre-process Arrays
-            String[] names = new String[n];
-            String[] issuers = new String[n]; // Store extracted issuers
-            double[] weights = new double[n];
-
-            for (int i = 0; i < n; i++) {
-                Row r = rows.get(i);
-                weights[i] = r.isNullAt(idxSens) ? 0.0 : ((Number)r.get(idxSens)).doubleValue();
-                String rawName = r.isNullAt(idxName) ? "" : r.get(idxName).toString().trim();
-                names[i] = rawName;
-
-                if (isEquity) {
-                    // [LOGIC FIX]: Extract Issuer logic: String after the last underscore
-                    int lastUnderscore = rawName.lastIndexOf('_');
-                    if (lastUnderscore >= 0 && lastUnderscore < rawName.length() - 1) {
-                        issuers[i] = rawName.substring(lastUnderscore + 1).trim();
-                    } else {
-                        issuers[i] = rawName; // Fallback if no underscore
-                    }
-                }
-            }
-
-            // Common lookup prefix
-            String commonPrefix = (first.isNullAt(idxRegime) ? "" : first.get(idxRegime).toString().trim()) + "|" +
-                                  riskClass + "|" +
-                                  (first.isNullAt(idxFamily) ? "" : first.get(idxFamily).toString().trim()) + "|" +
-                                  (first.isNullAt(idxBucket) ? "" : first.get(idxBucket).toString().trim()) + "|";
-
-            // N x N Matrix Loop
-            IntStream.range(0, n).forEach(i -> {
-                double sumMed = 0.0;
-                double sumLow = 0.0;
-                double sumHigh = 0.0;
-
-                for (int j = 0; j < n; j++) {
-                    String lookupKey;
-
-                    if (isEquity) {
-                        // [LOGIC FIX]: Equity Logic
-                        // 1. Calculate DIFF_ISSUER (Y if different, N if same)
-                        String diffIssuer = "Y";
-                        if (issuers[i] != null && issuers[j] != null && issuers[i].equals(issuers[j])) {
-                            diffIssuer = "N";
-                        }
-                        // 2. Lookup Key uses "Y|Y" or "N|N" based on the SQL screenshot logic
-                        // (Assuming Name_1 and Name_2 in correlation table both match the Diff Issuer flag)
-                        lookupKey = commonPrefix + diffIssuer + "|" + diffIssuer;
-                    } else {
-                        // [LOGIC FIX]: Non-Equity Logic -> Exact Name Match
-                        lookupKey = commonPrefix + names[i] + "|" + names[j];
-                    }
-
-                    double[] corrs = correlationMap.get(lookupKey);
-                    if (corrs != null) {
-                        double term = weights[i] * weights[j];
-                        sumMed += term * corrs[0];
-                        sumLow += term * corrs[1];
-                        sumHigh += term * corrs[2];
-                    }
-                }
-
-                // Add to result
-                finalResults.add(RowFactory.create(
-                    first.get(idxAggLvl),
-                    first.get(idxAggVal),
-                    first.get(idxRegime),
-                    first.get(idxEntity),
-                    first.isNullAt(idxBucket) ? "" : first.get(idxBucket).toString().trim(),
-                    first.get(idxRiskClass),
-                    first.get(idxFamily),
-                    names[i],
-                    sumMed,
-                    sumLow,
-                    sumHigh,
-                    weights[i] // WEIGHTED_SENSITIVITY_K
-                ));
-            });
-        });
-
-
-
-
-
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.RowFactory;
@@ -108,20 +8,17 @@ import org.apache.spark.sql.types.StructType;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.HashMap;
-import java.util.Objects;
-import java.util.concurrent.atomic.DoubleAdder;
 import java.util.stream.IntStream;
-import java.util.stream.Collectors;
 
 public class SbmStructuredProcessor {
 
     public Dataset<Row> process(SparkSession sparkSession, Map<String, Dataset<Row>> dsMap) {
         
         // =====================================================================
-        // 1. Input Retrieval & Safety Check
+        // 1. Input Retrieval
         // =====================================================================
         Dataset<Row> inputDs = dsMap.get("SBM_DELTA_VEGA_SENSITIVITIES");
         Dataset<Row> corrDs = dsMap.get("DELTA_VEGA_INTRA_BUCKET_RESULT_CORRELATION");
@@ -131,7 +28,6 @@ public class SbmStructuredProcessor {
         // =====================================================================
         // 2. Prepare Correlation Lookup (Driver Local Map)
         // =====================================================================
-        // Constraint: Cannot use Broadcast class, so we use a standard local Map.
         List<Row> corrRows = corrDs.select(
             "REGIME", "RISK_CLASS", "RISK_FACTOR_SCENARIO_FAMILY", "RISK_BUCKET",
             "RISK_FACTOR_NAME_1", "RISK_FACTOR_NAME_2",
@@ -141,13 +37,41 @@ public class SbmStructuredProcessor {
         Map<String, double[]> correlationMap = new HashMap<>(corrRows.size());
         
         for (Row r : corrRows) {
-            // Inline null-safe key generation
+            String rClass = r.isNullAt(1) ? "" : r.get(1).toString().trim();
+            String name1 = r.isNullAt(4) ? "" : r.get(4).toString().trim();
+            String name2 = r.isNullAt(5) ? "" : r.get(5).toString().trim();
+            
+            boolean isEquityRule = "EQUITY".equalsIgnoreCase(rClass) || "CSR_NON_SEC".equalsIgnoreCase(rClass);
+            
+            String keyPart1 = name1;
+            String keyPart2 = name2;
+
+            if (isEquityRule) {
+                // [Logic]: Equity Key = "Flag|Suffix"
+                
+                // 1. Extract Flag (First char: Y/N)
+                String flag1 = name1.length() > 0 ? name1.substring(0, 1) : "";
+                String flag2 = name2.length() > 0 ? name2.substring(0, 1) : "";
+                
+                // 2. Extract Suffix (Inline logic: substring after first underscore)
+                int idx1 = name1.indexOf('_');
+                String suff1 = (idx1 >= 0 && idx1 < name1.length() - 1) ? name1.substring(idx1 + 1).trim() : name1;
+
+                int idx2 = name2.indexOf('_');
+                String suff2 = (idx2 >= 0 && idx2 < name2.length() - 1) ? name2.substring(idx2 + 1).trim() : name2;
+                
+                // Combine: e.g., "Y_USD" -> "Y|USD"
+                keyPart1 = flag1 + "|" + suff1;
+                keyPart2 = flag2 + "|" + suff2;
+            }
+
+            // Construct Map Key
             String key = (r.isNullAt(0) ? "" : r.get(0).toString().trim()) + "|" +
-                         (r.isNullAt(1) ? "" : r.get(1).toString().trim()) + "|" +
+                         rClass + "|" +
                          (r.isNullAt(2) ? "" : r.get(2).toString().trim()) + "|" +
                          (r.isNullAt(3) ? "" : r.get(3).toString().trim()) + "|" +
-                         (r.isNullAt(4) ? "" : r.get(4).toString().trim()) + "|" +
-                         (r.isNullAt(5) ? "" : r.get(5).toString().trim());
+                         keyPart1 + "|" +
+                         keyPart2;
 
             correlationMap.put(key, new double[]{
                 r.isNullAt(6) ? 0.0 : ((Number)r.get(6)).doubleValue(),
@@ -157,13 +81,11 @@ public class SbmStructuredProcessor {
         }
 
         // =====================================================================
-        // 3. Collect & Group Data (Manual GroupBy)
+        // 3. Group Data Manually
         // =====================================================================
-        // Constraint: Cannot use RDD or Dataset functional ops (no MapFunction imported).
-        // Solution: Collect to Driver and group manually using Java Map.
         List<Row> allInputRows = inputDs.collectAsList();
         
-        // Indices setup
+        // Capture Indices
         final int idxRegime = inputDs.schema().fieldIndex("REGIME");
         final int idxRiskClass = inputDs.schema().fieldIndex("RISK_CLASS");
         final int idxFamily = inputDs.schema().fieldIndex("RISK_FACTOR_SCENARIO_FAMILY");
@@ -177,7 +99,6 @@ public class SbmStructuredProcessor {
         Map<String, List<Row>> bucketGroups = new HashMap<>();
 
         for (Row r : allInputRows) {
-            // Grouping Key: Entity|AggLevel|AggVal|Regime|Class|Family|Bucket
             String k = (r.isNullAt(idxEntity) ? "" : r.get(idxEntity).toString().trim()) + "|" +
                        (r.isNullAt(idxAggLvl) ? "" : r.get(idxAggLvl).toString().trim()) + "|" +
                        (r.isNullAt(idxAggVal) ? "" : r.get(idxAggVal).toString().trim()) + "|" +
@@ -185,31 +106,27 @@ public class SbmStructuredProcessor {
                        (r.isNullAt(idxRiskClass) ? "" : r.get(idxRiskClass).toString().trim()) + "|" +
                        (r.isNullAt(idxFamily) ? "" : r.get(idxFamily).toString().trim()) + "|" +
                        (r.isNullAt(idxBucket) ? "" : r.get(idxBucket).toString().trim());
-
             bucketGroups.computeIfAbsent(k, x -> new ArrayList<>()).add(r);
         }
 
         // =====================================================================
-        // 4. Matrix Calculation (Parallel Stream)
+        // 4. Parallel Calculation (Driver Side)
         // =====================================================================
-        // Thread-safe list to hold final results
         List<Row> finalResults = Collections.synchronizedList(new ArrayList<>());
 
-        // Iterate over each bucket (Group)
-        // We use bucketGroups.entrySet().parallelStream() to utilize multi-core on Driver
         bucketGroups.entrySet().parallelStream().forEach(entry -> {
             List<Row> rows = entry.getValue();
             int n = rows.size();
             if (n == 0) return;
 
-            // Context from first row
             Row first = rows.get(0);
             String riskClass = first.isNullAt(idxRiskClass) ? "" : first.get(idxRiskClass).toString().trim();
             boolean isEquity = "EQUITY".equalsIgnoreCase(riskClass) || "CSR_NON_SEC".equalsIgnoreCase(riskClass);
 
             // Pre-process Arrays
             String[] names = new String[n];
-            String[] prefixes = new String[n];
+            String[] issuers = new String[n]; // For Diff Issuer check (Last underscore)
+            String[] suffixes = new String[n]; // For Correlation Suffix check (First underscore)
             double[] weights = new double[n];
 
             for (int i = 0; i < n; i++) {
@@ -219,22 +136,30 @@ public class SbmStructuredProcessor {
                 names[i] = rawName;
 
                 if (isEquity) {
+                    // 1. Issuer Logic (Last underscore, for Diff Issuer check)
                     int lastUnderscore = rawName.lastIndexOf('_');
-                    if (lastUnderscore > 0) {
-                        prefixes[i] = rawName.substring(0, lastUnderscore).trim();
+                    if (lastUnderscore >= 0 && lastUnderscore < rawName.length() - 1) {
+                        issuers[i] = rawName.substring(lastUnderscore + 1).trim();
                     } else {
-                        prefixes[i] = rawName;
+                        issuers[i] = rawName;
+                    }
+                    
+                    // 2. Suffix Logic (Inline: First underscore, for matching correlation rule)
+                    int firstUnderscore = rawName.indexOf('_');
+                    if (firstUnderscore >= 0 && firstUnderscore < rawName.length() - 1) {
+                        suffixes[i] = rawName.substring(firstUnderscore + 1).trim();
+                    } else {
+                        suffixes[i] = rawName;
                     }
                 }
             }
 
-            // Common lookup prefix
             String commonPrefix = (first.isNullAt(idxRegime) ? "" : first.get(idxRegime).toString().trim()) + "|" +
                                   riskClass + "|" +
                                   (first.isNullAt(idxFamily) ? "" : first.get(idxFamily).toString().trim()) + "|" +
                                   (first.isNullAt(idxBucket) ? "" : first.get(idxBucket).toString().trim()) + "|";
 
-            // N x N Matrix Loop
+            // Matrix Loop
             IntStream.range(0, n).forEach(i -> {
                 double sumMed = 0.0;
                 double sumLow = 0.0;
@@ -242,13 +167,29 @@ public class SbmStructuredProcessor {
 
                 for (int j = 0; j < n; j++) {
                     String lookupKey;
+
                     if (isEquity) {
-                        lookupKey = commonPrefix + prefixes[i] + "|" + prefixes[j];
+                        // [Logic]: Equity Lookup
+                        
+                        // Step 1: Calculate DIFF_ISSUER (Y/N)
+                        String diffIssuer = "Y";
+                        if (issuers[i] != null && issuers[j] != null && issuers[i].equals(issuers[j])) {
+                            diffIssuer = "N";
+                        }
+                        
+                        // Step 2: Combine DiffIssuer with Suffixes
+                        // Key matches Map: "Prefix | Flag1 | Suffix1 | Flag2 | Suffix2"
+                        // Here: "Prefix | DiffIssuer | Suffix_i | DiffIssuer | Suffix_j"
+                        lookupKey = commonPrefix + 
+                                    diffIssuer + "|" + suffixes[i] + "|" + 
+                                    diffIssuer + "|" + suffixes[j];
                     } else {
+                        // Non-Equity: Exact Name Match
                         lookupKey = commonPrefix + names[i] + "|" + names[j];
                     }
 
                     double[] corrs = correlationMap.get(lookupKey);
+                    
                     if (corrs != null) {
                         double term = weights[i] * weights[j];
                         sumMed += term * corrs[0];
@@ -257,7 +198,6 @@ public class SbmStructuredProcessor {
                     }
                 }
 
-                // Add to result
                 finalResults.add(RowFactory.create(
                     first.get(idxAggLvl),
                     first.get(idxAggVal),
@@ -267,16 +207,14 @@ public class SbmStructuredProcessor {
                     first.get(idxRiskClass),
                     first.get(idxFamily),
                     names[i],
-                    sumMed,
-                    sumLow,
-                    sumHigh,
-                    weights[i] // WEIGHTED_SENSITIVITY_K
+                    sumMed, sumLow, sumHigh,
+                    weights[i]
                 ));
             });
         });
 
         // =====================================================================
-        // 5. Output Schema & Return
+        // 5. Output Schema
         // =====================================================================
         StructType outSchema = DataTypes.createStructType(new StructField[]{
             DataTypes.createStructField("AGGREGATION_LEVEL", DataTypes.StringType, true),
@@ -293,7 +231,6 @@ public class SbmStructuredProcessor {
             DataTypes.createStructField("WEIGHTED_SENSITIVITY_K", DataTypes.DoubleType, false)
         });
 
-        // Convert List<Row> back to Dataset<Row>
         return sparkSession.createDataFrame(finalResults, outSchema);
     }
 }
