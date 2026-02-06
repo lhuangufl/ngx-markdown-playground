@@ -1,15 +1,1 @@
-Ahead of our upcoming review, I wanted to share a brief high-level summary of the approach we’ve taken for the Curvature and Sensitivity calculations.
 
-The Challenge The standard method (using SQL joins) requires the system to generate every possible combination of risk factors before summarizing them. With our volume of data, this step was creating a massive temporary data "explosion" (billions of intermediate rows), which forced the system to spend hours writing and reading data from disk rather than actually calculating.
-
-The Solution We have implemented a "streaming aggregation" approach. Instead of generating that massive list of combinations first, we now process the interactions in real-time. The system calculates the risk impact, adds it to the summary total, and immediately moves to the next item without ever storing the intermediate data.
-
-Key Benefits:
-
-Speed: Reduces processing time from hours to minutes by eliminating the storage bottleneck.
-
-Precision: We have strictly strictly mapped the logic to your SQL requirements, including the complex Equity Issuer matching and Curvature sign-dependent logic.
-
-I look forward to walking you through the details.
-
-Best regards,
