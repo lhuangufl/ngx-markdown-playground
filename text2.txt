@@ -1,1 +1,67 @@
+// Map<String, List<Row>> bucketGroups
+{
+  // 🟢 GREEN SLICE (Bucket A)
+  "Regime|Equity|Bucket A": [
+     Row(RF 1, 1000.0),
+     Row(RF 2, 500.0),
+     Row(RF 3, 300.0),
+     Row(RF 4, 100.0)
+  ],
 
+  // 🟣 PURPLE SLICE (Bucket B)
+  "Regime|Equity|Bucket B": [
+     Row(RF 5, 200.0),
+     Row(RF 6, 150.0),
+     ...
+     Row(RF 9, 100.0)
+  ],
+
+  // 🔵 BLUE SLICE (Bucket C)
+  "Regime|Equity|Bucket C": [
+     Row(RF 10, 100.0),
+     Row(RF 11, 200.0),
+     Row(RF 12, 300.0)
+  ]
+}
+
+
+// Dataset<Row> inputDs.collectAsList()
+[
+  { "RISK_BUCKET": "Bucket A", "RISK_FACTOR": "RF 1", "SENSITIVITY": 1000.0 },
+  { "RISK_BUCKET": "Bucket A", "RISK_FACTOR": "RF 2", "SENSITIVITY": 500.0 },
+  { "RISK_BUCKET": "Bucket B", "RISK_FACTOR": "RF 5", "SENSITIVITY": 200.0 },
+  { "RISK_BUCKET": "Bucket A", "RISK_FACTOR": "RF 3", "SENSITIVITY": 300.0 },
+  { "RISK_BUCKET": "Bucket C", "RISK_FACTOR": "RF 10", "SENSITIVITY": 100.0 },
+  ...
+]
+
+// Iteration i=0 (RF 1)
+   // Inner Loop j=0 (RF 1):
+   lookupKey = "Bucket A|RF 1|RF 1";
+   correlation = 1.00; // From Map (Diagonal)
+   term = 1000 * 1000 * 1.00; // Added to Sum
+
+   // Inner Loop j=1 (RF 2):
+   lookupKey = "Bucket A|RF 1|RF 2";
+   correlation = 0.34; // From Map (Green Box Row 1 Col 2)
+   term = 1000 * 500 * 0.34; // Added to Sum
+
+   // Inner Loop j=2 (RF 3):
+   lookupKey = "Bucket A|RF 1|RF 3";
+   correlation = 0.50; // From Map (Green Box Row 1 Col 3)
+   term = 1000 * 300 * 0.50; // Added to Sum
+
+// ... Iteration continues for RF 2, RF 3, RF 4 ...
+
+
+[
+  // 🟢 Results from Thread 1
+  { "BUCKET": "Bucket A", "RF": "RF 1", "Total_Risk": 154000.0 },
+  { "BUCKET": "Bucket A", "RF": "RF 2", "Total_Risk": 89000.0 },
+
+  // 🟣 Results from Thread 2
+  { "BUCKET": "Bucket B", "RF": "RF 5", "Total_Risk": 45000.0 },
+  
+  // 🔵 Results from Thread 3
+  { "BUCKET": "Bucket C", "RF": "RF 10", "Total_Risk": 12000.0 }
+]
